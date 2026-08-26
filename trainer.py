@@ -7,6 +7,7 @@ class OnlineTrainer:
     def __init__(self, config, replay_buffer, logger, logdir, train_envs, eval_envs):
         self.replay_buffer = replay_buffer
         self.logger = logger
+        self.logdir = logdir
         self.train_envs = train_envs
         self.eval_envs = eval_envs
         self.steps = int(config.steps)
@@ -15,6 +16,9 @@ class OnlineTrainer:
         self.eval_episode_num = int(config.eval_episode_num)
         self.video_pred_log = bool(config.video_pred_log)
         self.params_hist_log = bool(config.params_hist_log)
+        self.checkpoint_every = int(config.checkpoint_every)
+        if self.checkpoint_every < 0:
+            raise ValueError("trainer.checkpoint_every must be zero or positive")
         self.batch_length = int(config.batch_length)
         batch_steps = int(config.batch_size * config.batch_length)
         # train_ratio is based on data steps rather than environment steps.
@@ -23,6 +27,17 @@ class OnlineTrainer:
         self._should_log = tools.Every(config.update_log_every)
         self._should_eval = tools.Every(self.eval_every)
         self._action_repeat = config.action_repeat
+
+    def save_checkpoint(self, agent, step):
+        """Save a resumable model snapshot for the given environment step."""
+        items_to_save = {
+            "step": step,
+            "agent_state_dict": agent.state_dict(),
+            "optims_state_dict": tools.recursively_collect_optim_state_dict(agent),
+        }
+        path = self.logdir / f"checkpoint_{step:012d}.pt"
+        torch.save(items_to_save, path)
+        print(f"Saved checkpoint: {path}")
 
     def eval(self, agent, train_step):
         """Run evaluation episodes.
@@ -108,6 +123,11 @@ class OnlineTrainer:
         envs = self.train_envs
         video_cache = []
         step = self.replay_buffer.count() * self._action_repeat
+        next_checkpoint = (
+            ((step // self.checkpoint_every) + 1) * self.checkpoint_every
+            if self.checkpoint_every > 0
+            else None
+        )
         update_count = 0
         # (B,)
         done = torch.ones(envs.env_num, dtype=torch.bool, device=agent.device)
@@ -189,3 +209,7 @@ class OnlineTrainer:
                         for name, param in agent._named_params.items():
                             self.logger.histogram(name, tools.to_np(param))
                     self.logger.write(step, fps=True)
+            if next_checkpoint is not None and step >= next_checkpoint:
+                self.save_checkpoint(agent, step)
+                while step >= next_checkpoint:
+                    next_checkpoint += self.checkpoint_every

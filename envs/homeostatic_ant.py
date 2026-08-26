@@ -8,10 +8,15 @@ from custom_env.ant_env import HomeostaticAntEnv
 class HomeostaticAntR2Env(gym.Env):
     """Converts the Gymnasium Ant environment to R2Dreamer's API."""
 
-    def __init__(self, cfg, seed=0):
+    def __init__(self, cfg, seed=0, provide_terminal_signals=False):
         self._env = HomeostaticAntEnv(cfg)
         self._seed = seed
         self._needs_seed = True
+        # A physiological-limit reset is still an episode boundary, but in a
+        # continuing homeostatic task it should not necessarily imply zero
+        # continuation value. Negative rewards would otherwise make death
+        # appear attractive to the value function.
+        self._provide_terminal_signals = provide_terminal_signals
 
         height, width = cfg.image_size
         obs_spaces = {
@@ -60,15 +65,20 @@ class HomeostaticAntR2Env(gym.Env):
     def step(self, action):
         obs, reward, terminated, truncated, info = self._env.step(action)
 
-        # For the continuing homeostatic task, only a true physiological
-        # termination ends the R2Dreamer sequence.
+        # A physiological limit still triggers an environment reset. By
+        # default, however, do not expose it as an RL terminal: is_last keeps
+        # the RSSM episode boundary while is_terminal controls Dreamer's
+        # continuation target.
         done = bool(terminated)
         converted = self._convert(
             obs,
             is_first=False,
             is_last=done,
-            is_terminal=done,
+            is_terminal=done and self._provide_terminal_signals,
         )
-        info["discount"] = np.array(0.0 if done else 1.0, dtype=np.float32)
+        info["discount"] = np.array(
+            0.0 if done and self._provide_terminal_signals else 1.0,
+            dtype=np.float32,
+        )
 
         return converted, np.float32(reward), done, info

@@ -6,6 +6,9 @@ env_num: 16
 eval_episode_num: 0
 action_repeat: 1
 train_ratio: 64
+# Keep physiological-limit resets out of Dreamer's continuation target. Set to
+# true only when death should terminate returns.
+provide_terminal_signals: false
 # time_limit: 1000
 
 seed: ${seed}

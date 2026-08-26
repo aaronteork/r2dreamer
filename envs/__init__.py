@@ -111,7 +111,11 @@ def make_env(config, id):
             image_size=tuple(config.size),
         )
 
-        env = HomeostaticAntR2Env(ant_cfg, seed=config.seed + id)
+        env = HomeostaticAntR2Env(
+            ant_cfg,
+            seed=config.seed + id,
+            provide_terminal_signals=bool(getattr(config, "provide_terminal_signals", False)),
+        )
     else:
         raise NotImplementedError(suite)
     # env = wrappers.TimeLimit(env, config.time_limit // config.action_repeat)
