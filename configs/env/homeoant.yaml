@@ -1,0 +1,22 @@
+task: 'homeoant_ant'
+
+# Use one environment for initial integration testing.
+steps: 3.0e6
+env_num: 16
+eval_episode_num: 0
+action_repeat: 1
+train_ratio: 64
+# time_limit: 1000
+
+seed: ${seed}
+device: ${device}
+
+size: [64, 64]
+
+encoder:
+  cnn_keys: 'image'
+  mlp_keys: 'proprioception|internal_state'
+
+decoder:
+  cnn_keys: "image"
+  mlp_keys: "proprioception|internal_state"

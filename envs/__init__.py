@@ -100,7 +100,22 @@ def make_env(config, id):
             config.camera,
             config.seed + id,
         )
+    elif suite == "homeoant":
+        from custom_env.config_env import EnvConfig
+        from envs.homeostatic_ant import HomeostaticAntR2Env
+
+        ant_cfg = EnvConfig(
+            seed=config.seed + id,
+            is_training=True,
+            max_steps=float("inf"),
+            image_size=tuple(config.size),
+        )
+
+        env = HomeostaticAntR2Env(ant_cfg, seed=config.seed + id)
     else:
         raise NotImplementedError(suite)
-    env = wrappers.TimeLimit(env, config.time_limit // config.action_repeat)
+    # env = wrappers.TimeLimit(env, config.time_limit // config.action_repeat)
+    if suite != "homeoant":
+        env = wrappers.TimeLimit(env, config.time_limit // config.action_repeat)
+
     return wrappers.Dtype(env)
