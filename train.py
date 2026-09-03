@@ -51,6 +51,9 @@ def main(config):
     ).to(config.device)
 
     policy_trainer = OnlineTrainer(config.trainer, replay_buffer, logger, logdir, train_envs, eval_envs)
+    # Preserve the randomly initialized policy before collecting any data or
+    # applying optimizer updates, so checkpoint-based evaluation includes step 0.
+    policy_trainer.save_checkpoint(agent, 0)
     policy_trainer.begin(agent)
 
     items_to_save = {
