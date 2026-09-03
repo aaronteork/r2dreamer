@@ -27,7 +27,7 @@ buffer:
 trainer:
   steps: ${env.steps}
   pretrain: 0
-  eval_every: 1e4
+  eval_every: 2e5
   eval_episode_num: ${env.eval_episode_num}
   batch_size: ${batch_size}
   batch_length: ${batch_length}
@@ -37,5 +37,5 @@ trainer:
   update_log_every: 5e3
   # Set to a positive number of environment steps to retain periodic snapshots;
   # 0 disables periodic checkpointing (the final latest.pt is always saved).
-  checkpoint_every: 200000
+  checkpoint_every: 2e5
   action_repeat: ${env.action_repeat}

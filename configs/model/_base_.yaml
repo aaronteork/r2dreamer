@@ -21,9 +21,9 @@ slow_target_fraction: 0.02
 loss_scales:
   # Default coefficient for all observation decoder heads. When rep_loss is
   # "dreamer", add an observation key here to override its coefficient, e.g.:
-  proprioception: 37.0
-  internal_state: 500.0
-  vision: 0.06
+  proprioception: 25.0
+  internal_state: 400.0
+  vision: 1.0
   barlow: 0.05
   infonce: 1.0
   recon: 1.0
