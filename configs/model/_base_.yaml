@@ -23,7 +23,7 @@ loss_scales:
   # "dreamer", add an observation key here to override its coefficient, e.g.:
   proprioception: 25.0
   internal_state: 400.0
-  vision: 1.0
+  image: 1.0
   barlow: 0.05
   infonce: 1.0
   recon: 1.0
