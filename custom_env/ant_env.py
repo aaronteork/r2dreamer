@@ -393,9 +393,9 @@ class HomeostaticAntEnv(AntEnv, EzPickle):
         time_color = (0, 0, 0)
 
         stats = [
-            (f"Hunger: {self.hunger:.2f}", (0, 255, 0)),  # Green
+            (f"Hunger: {self.hunger:.2f}", (255, 0, 0)),  # Red
             (f"Thirst: {self.thirst:.2f}", (0, 0, 255)),  # Blue
-            (f"Temp:   {self.temperature:.2f}", (255, 0, 0)),  # Red
+            # (f"Temp:   {self.temperature:.2f}", (255, 0, 0)),  # Red
             (f"Time:   {time_text}", time_color),
         ]
 
