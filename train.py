@@ -2,6 +2,7 @@ import atexit
 import pathlib
 import sys
 import warnings
+import datetime as dt
 
 import hydra
 import torch
@@ -20,6 +21,7 @@ torch.set_float32_matmul_precision("high")
 
 @hydra.main(version_base=None, config_path="configs", config_name="configs")
 def main(config):
+    print(f"Starting run at {dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     tools.set_seed_everywhere(config.seed)
     if config.deterministic_run:
         tools.enable_deterministic_run()
@@ -56,7 +58,7 @@ def main(config):
         "optims_state_dict": tools.recursively_collect_optim_state_dict(agent),
     }
     torch.save(items_to_save, logdir / "latest.pt")
-
+    print(f"Ending run at {dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
 if __name__ == "__main__":
     main()

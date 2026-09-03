@@ -33,6 +33,19 @@ Switching algorithms:
 python3 train.py model.rep_loss=r2dreamer
 ```
 
+When training the decoder-based Dreamer baseline, `model.loss_scales.recon` is
+the default reconstruction-loss coefficient for every observation decoder
+head. Individual heads can override it by using their observation key:
+
+```bash
+python3 train.py model.rep_loss=dreamer \
+  +model.loss_scales.proprioception=1.0 \
+  +model.loss_scales.internal_state=0.25
+```
+
+These overrides may also be added directly under `model.loss_scales` in the
+model YAML. Heads without an explicit override continue to use `recon`.
+
 For easier code reading, inline tensor shape annotations are provided. See [`docs/tensor_shapes.md`](docs/tensor_shapes.md).
 
 

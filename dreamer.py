@@ -82,8 +82,13 @@ class Dreamer(nn.Module):
                 self.rssm.flat_stoch,
                 shapes,
             )
+            # ``recon`` is the default for every observation decoder head. An
+            # explicitly configured observation key takes precedence, allowing
+            # heterogeneous targets (for example, pixels and proprioception) to
+            # contribute different amounts to the world-model objective.
             recon = self._loss_scales.pop("recon")
-            self._loss_scales.update({k: recon for k in self.decoder.all_keys})
+            for key in self.decoder.all_keys:
+                self._loss_scales.setdefault(key, recon)
             modules.update({"decoder": self.decoder})
         elif self.rep_loss == "r2dreamer" or self.rep_loss == "infonce":
             # add projector for latent to embedding

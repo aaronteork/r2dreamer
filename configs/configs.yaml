@@ -37,5 +37,5 @@ trainer:
   update_log_every: 5e3
   # Set to a positive number of environment steps to retain periodic snapshots;
   # 0 disables periodic checkpointing (the final latest.pt is always saved).
-  checkpoint_every: 0
+  checkpoint_every: 200000
   action_repeat: ${env.action_repeat}
