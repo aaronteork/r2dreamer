@@ -1,3 +1,5 @@
+import math
+
 import torch
 from torch import distributions as torchd
 from torch.nn import functional as F
@@ -214,12 +216,77 @@ class Bound:
         return self._dist.log_prob(x)
 
 
+class BetaDist:
+    """Independent Beta policy transformed from ``(0, 1)`` to ``(-1, 1)``.
+
+    Actor parameters and distribution arithmetic are kept in float32.  This is
+    important under AMP because the Beta implementation uses special functions
+    that are less robust in reduced precision.  Actions passed to ``log_prob``
+    are clamped just inside the support to avoid infinities at exactly -1 or 1.
+    """
+
+    has_rsample = True
+
+    def __init__(self, concentration1, concentration0):
+        self.concentration1 = to_f32(concentration1)
+        self.concentration0 = to_f32(concentration0)
+        self._dist = torchd.beta.Beta(self.concentration1, self.concentration0)
+
+    @property
+    def mean(self):
+        return 2.0 * self._dist.mean - 1.0
+
+    @property
+    def mode(self):
+        # The actor parameterization keeps both concentrations above one, where
+        # this is the unique interior mode.  Falling back to the mean makes the
+        # wrapper robust if constructed directly with other concentrations.
+        denom = self.concentration1 + self.concentration0 - 2.0
+        interior = (self.concentration1 > 1.0) & (self.concentration0 > 1.0)
+        unit_mode = (self.concentration1 - 1.0) / denom.clamp_min(torch.finfo(torch.float32).eps)
+        unit_mode = torch.where(interior, unit_mode, self._dist.mean)
+        return 2.0 * unit_mode - 1.0
+
+    def rsample(self, sample_shape=()):
+        # torch.distributions.Beta supports pathwise (implicit) gradients.
+        return 2.0 * self._dist.rsample(sample_shape) - 1.0
+
+    def sample(self, sample_shape=()):
+        return 2.0 * self._dist.sample(sample_shape) - 1.0
+
+    def log_prob(self, action):
+        action = to_f32(action)
+        eps = torch.finfo(action.dtype).eps
+        unit_action = ((action + 1.0) / 2.0).clamp(eps, 1.0 - eps)
+        # The affine transform has absolute Jacobian 2 per action dimension.
+        return (self._dist.log_prob(unit_action) - math.log(2.0)).sum(dim=-1)
+
+    def entropy(self):
+        # Entropy under x = 2y - 1 gains log(2) per action dimension.
+        return (self._dist.entropy() + math.log(2.0)).sum(dim=-1)
+
+
 def bounded_normal(x, min_std, max_std, **kwargs):
     mean, std = torch.chunk(x, 2, dim=-1)
     std = (max_std - min_std) * torch.sigmoid(std + 2.0) + min_std
     # NOTE: Bound can be added
     dist = torchd.normal.Normal(torch.tanh(to_f32(mean)), to_f32(std))
     return torchd.independent.Independent(dist, 1)
+
+
+def beta(x, min_concentration=1.0, max_concentration=1000.0, **kwargs):
+    """Construct a stable, unimodal Beta actor over actions in ``[-1, 1]``."""
+    min_concentration = float(min_concentration)
+    max_concentration = float(max_concentration)
+    if min_concentration < 1.0:
+        raise ValueError("beta min_concentration must be at least 1.0")
+    if max_concentration <= min_concentration:
+        raise ValueError("beta max_concentration must be greater than min_concentration")
+
+    raw_alpha, raw_beta = torch.chunk(to_f32(x), 2, dim=-1)
+    alpha = (F.softplus(raw_alpha) + min_concentration).clamp(max=max_concentration)
+    beta_param = (F.softplus(raw_beta) + min_concentration).clamp(max=max_concentration)
+    return BetaDist(alpha, beta_param)
 
 
 def normal_std_fixed(mean, std, **kwargs):

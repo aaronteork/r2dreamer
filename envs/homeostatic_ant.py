@@ -51,8 +51,17 @@ class HomeostaticAntR2Env(gym.Env):
             result["heat_sensor"] = obs["heat_sensor"].astype(np.float32)
         return result
 
-    def reset(self):
-        if self._needs_seed:
+    def reset(self, *, seed=None, options=None):
+        """Reset the adapter, optionally with an explicit evaluation seed.
+
+        The return value intentionally remains the observation-only format used
+        by R2Dreamer's training loop.
+        """
+        del options
+        if seed is not None:
+            obs, _ = self._env.reset(seed=seed)
+            self._needs_seed = False
+        elif self._needs_seed:
             obs, _ = self._env.reset(seed=self._seed)
             self._needs_seed = False
         else:

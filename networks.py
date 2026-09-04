@@ -347,6 +347,12 @@ class MLPHead(nn.Module):
         if self._dist_name == "bounded_normal":
             self.last = nn.Linear(self.mlp.out_dim, config.shape[0] * 2, bias=True)
             kwargs = {"min_std": float(config.dist.min_std), "max_std": float(config.dist.max_std)}
+        elif self._dist_name == "beta":
+            self.last = nn.Linear(self.mlp.out_dim, config.shape[0] * 2, bias=True)
+            kwargs = {
+                "min_concentration": float(config.dist.min_concentration),
+                "max_concentration": float(config.dist.max_concentration),
+            }
         elif self._dist_name == "onehot":
             self.last = nn.Linear(self.mlp.out_dim, config.shape[0], bias=True)
             kwargs = {"unimix_ratio": float(config.dist.unimix_ratio)}
