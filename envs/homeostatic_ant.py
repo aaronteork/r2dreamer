@@ -63,6 +63,12 @@ class HomeostaticAntR2Env(gym.Env):
         )
 
     def step(self, action):
+        action = np.clip(
+            action,
+            self.action_space.low,
+            self.action_space.high,
+        ).astype(np.float32, copy=False)
+
         obs, reward, terminated, truncated, info = self._env.step(action)
 
         # A physiological limit still triggers an environment reset. By
