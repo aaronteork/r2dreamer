@@ -17,6 +17,18 @@ from optim import LaProp, clip_grad_agc_
 from tools import to_f32
 
 
+def _mask_invalid_imagination_starts(weight, is_last):
+    """Zero rollout weights whose replay start is an episode boundary."""
+    valid_start = (1.0 - to_f32(is_last)).reshape(weight.shape[0], 1, 1)
+    return weight * valid_start
+
+
+def _select_replay_bootstrap(imag_boot, value, last, term):
+    """Use the observed critic at reset-only boundaries, never post-reset imagination."""
+    nonterminal_boundary = (last > 0.5) & (term < 0.5)
+    return torch.where(nonterminal_boundary, value, imag_boot)
+
+
 class Dreamer(nn.Module):
     def __init__(self, config, obs_space, act_space):
         super().__init__()
@@ -29,6 +41,7 @@ class Dreamer(nn.Module):
         self.return_ema = networks.ReturnEMA(device=self.device)
         self.act_dim = act_space.n if hasattr(act_space, "n") else sum(act_space.shape)
         self.rep_loss = str(config.rep_loss)
+        self.fixed_continuation = bool(getattr(config, "fixed_continuation", False))
 
         # World model components
         shapes = {k: tuple(v.shape) for k, v in obs_space.spaces.items()}
@@ -351,6 +364,19 @@ class Dreamer(nn.Module):
         replay_buffer.update(index, stoch.detach(), deter.detach())
         return metrics
 
+    def _add_continuation_loss(self, losses, feat, is_terminal):
+        """Add continuation prediction loss unless this is a continuing task."""
+        if self.fixed_continuation:
+            return
+        cont = 1.0 - to_f32(is_terminal)
+        losses["con"] = torch.mean(-self.cont(feat).log_prob(cont))
+
+    def _imagined_continuation(self, imag_feat):
+        """Return the continuation used to discount imagined trajectories."""
+        if self.fixed_continuation:
+            return torch.ones((*imag_feat.shape[:-1], 1), dtype=imag_feat.dtype, device=imag_feat.device)
+        return self._frozen_cont(imag_feat).mean
+
     def _cal_grad(self, data, initial):
         """Compute gradients for one batch.
 
@@ -433,8 +459,7 @@ class Dreamer(nn.Module):
 
         # reward and continue
         losses["rew"] = torch.mean(-self.reward(feat).log_prob(to_f32(data["reward"])))
-        cont = 1.0 - to_f32(data["is_terminal"])
-        losses["con"] = torch.mean(-self.cont(feat).log_prob(cont))
+        self._add_continuation_loss(losses, feat, data["is_terminal"])
         # log
         metrics["dyn_entropy"] = torch.mean(self.rssm.get_dist(prior_logit).entropy())
         metrics["rep_entropy"] = torch.mean(self.rssm.get_dist(post_logit).entropy())
@@ -451,14 +476,20 @@ class Dreamer(nn.Module):
 
         # (B*T, T_imag, 1)
         imag_reward = self._frozen_reward(imag_feat).mode()
-        # (B*T, T_imag, 1)  probability of continuation
-        imag_cont = self._frozen_cont(imag_feat).mean
+        # (B*T, T_imag, 1) probability of continuation. Continuing tasks use
+        # exactly one instead of learning a state-dependent effective discount.
+        imag_cont = self._imagined_continuation(imag_feat)
         # (B*T, T_imag, 1)
         imag_value = self._frozen_value(imag_feat).mode()
         imag_slow_value = self._frozen_slow_value(imag_feat).mode()
         disc = 1 - 1 / self.horizon
         # (B*T, T_imag, 1)
         weight = torch.cumprod(imag_cont * disc, dim=1)
+        # Replay boundary observations do not have real successor transitions:
+        # the environment resets immediately after them. Keep the static
+        # imagination batch shape, but prevent those unsupported rollouts from
+        # contributing to either actor or value learning.
+        weight = _mask_invalid_imagination_starts(weight, data["is_last"])
         last = torch.zeros_like(imag_cont)
         term = 1 - imag_cont
         ret = self._lambda_return(
@@ -506,9 +537,14 @@ class Dreamer(nn.Module):
             to_f32(data["reward"]),
         )
         feat = self.rssm.get_feat(post_stoch, post_deter)
-        boot = ret[:, 0].reshape(B, T, 1)
         value = self._frozen_value(feat).mode()
         slow_value = self._frozen_slow_value(feat).mode()
+        imag_boot = ret[:, 0].reshape(B, T, 1)
+        # A nonterminal reset boundary should bootstrap once from the critic at
+        # the observed boundary state. Rolling imagination beyond that state is
+        # unsupported because the next real observation belongs to a reset
+        # episode. True terminals retain their existing terminal masking.
+        boot = _select_replay_bootstrap(imag_boot, value, last, term)
         disc = 1 - 1 / self.horizon
         weight = 1.0 - last
         ret = self._lambda_return(last, term, reward, value, boot, disc, self.lamb)

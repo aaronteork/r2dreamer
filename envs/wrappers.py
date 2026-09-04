@@ -124,5 +124,5 @@ class Dtype(gym.Wrapper):
         obs, rew, done, info = self.env.step(action)
         return tools.convert(obs), np.float32(rew), done, info
 
-    def reset(self):
-        return tools.convert(self.env.reset())
+    def reset(self, *args, **kwargs):
+        return tools.convert(self.env.reset(*args, **kwargs))

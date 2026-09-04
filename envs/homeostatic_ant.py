@@ -8,7 +8,24 @@ from custom_env.ant_env import HomeostaticAntEnv
 class HomeostaticAntR2Env(gym.Env):
     """Converts the Gymnasium Ant environment to R2Dreamer's API."""
 
-    def __init__(self, cfg, seed=0, provide_terminal_signals=False):
+    _SURVIVAL_LOG_KEYS = (
+        "termination_reason",
+        "food_consumed",
+        "water_consumed",
+        "is_flipped",
+        "hunger",
+        "thirst",
+        "posture",
+        "z_pos",
+    )
+
+    def __init__(
+        self,
+        cfg,
+        seed=0,
+        provide_terminal_signals=False,
+        log_survival_metrics=False,
+    ):
         self._env = HomeostaticAntEnv(cfg)
         self._seed = seed
         self._needs_seed = True
@@ -17,6 +34,7 @@ class HomeostaticAntR2Env(gym.Env):
         # continuation value. Negative rewards would otherwise make death
         # appear attractive to the value function.
         self._provide_terminal_signals = provide_terminal_signals
+        self._log_survival_metrics = log_survival_metrics
 
         height, width = cfg.image_size
         obs_spaces = {
@@ -29,11 +47,20 @@ class HomeostaticAntR2Env(gym.Env):
         }
         if "heat_sensor" in self._env.observation_space:
             obs_spaces["heat_sensor"] = self._env.observation_space["heat_sensor"]
+        if self._log_survival_metrics:
+            obs_spaces.update(
+                {
+                    f"log_{key}": spaces.Box(
+                        -np.inf, np.inf, shape=(), dtype=np.float32
+                    )
+                    for key in self._SURVIVAL_LOG_KEYS
+                }
+            )
 
         self.observation_space = spaces.Dict(obs_spaces)
         self.action_space = self._env.action_space
 
-    def _convert(self, obs, is_first, is_last, is_terminal):
+    def _convert(self, obs, is_first, is_last, is_terminal, info=None):
         # Your vision: C,H,W float32 in [0, 1].
         # R2Dreamer image: H,W,C uint8 in [0, 255].
         image = np.moveaxis(obs["vision"], 0, -1)
@@ -49,6 +76,14 @@ class HomeostaticAntR2Env(gym.Env):
         }
         if "heat_sensor" in obs:
             result["heat_sensor"] = obs["heat_sensor"].astype(np.float32)
+        if self._log_survival_metrics:
+            info = info or {}
+            result.update(
+                {
+                    f"log_{key}": np.asarray(info.get(key, 0.0), dtype=np.float32)
+                    for key in self._SURVIVAL_LOG_KEYS
+                }
+            )
         return result
 
     def reset(self, *, seed=None, options=None):
@@ -90,6 +125,7 @@ class HomeostaticAntR2Env(gym.Env):
             is_first=False,
             is_last=done,
             is_terminal=done and self._provide_terminal_signals,
+            info=info,
         )
         info["discount"] = np.array(
             0.0 if done and self._provide_terminal_signals else 1.0,
