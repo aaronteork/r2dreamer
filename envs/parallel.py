@@ -37,7 +37,7 @@ class ParallelEnv:
                 td[key] = td[key].unsqueeze(-1)
         return td
 
-    def step(self, action, done):
+    def step(self, action, done, reset_seeds=None):
         """Step all environments.
 
         Notes
@@ -52,7 +52,12 @@ class ParallelEnv:
         # Ensure inputs are on CPU for worker processes.
         action_np = tools.to_np(action)  # handles any device via .detach().cpu().numpy()
         done = done.cpu() if done.is_cuda else done
-        promise = [e.reset() if d else e.step(a) for e, a, d in zip(self.envs, action_np, done)]
+        if reset_seeds is None:
+            reset_seeds = [None] * self.env_num
+        promise = [
+            e.reset(seed=int(seed)) if d and seed is not None else e.reset() if d else e.step(a)
+            for e, a, d, seed in zip(self.envs, action_np, done, reset_seeds)
+        ]
         new_o, new_r, new_d = [], [], []
         for p, d in zip(promise, done):
             if d:

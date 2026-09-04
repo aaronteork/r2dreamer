@@ -29,6 +29,10 @@ trainer:
   pretrain: 0
   eval_every: 2e5
   eval_episode_num: ${env.eval_episode_num}
+  # A zero cap preserves the existing evaluator for other environments.
+  eval_max_steps: ${oc.select:env.eval_max_steps,0}
+  survival_eval: ${oc.select:env.survival_eval,false}
+  eval_seed: ${seed}
   batch_size: ${batch_size}
   batch_length: ${batch_length}
   train_ratio: ${env.train_ratio}

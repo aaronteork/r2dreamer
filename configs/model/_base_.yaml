@@ -7,6 +7,9 @@ compile: True
 log_grads: False
 device: ${device}
 rep_loss: "r2dreamer" # r2dreamer/dreamer/infonce/dreamerpro
+# Continuing tasks can opt out of the learned continuation model. The
+# oc.select fallback keeps all existing environment configs terminal-aware.
+fixed_continuation: ${oc.select:env.fixed_continuation,false}
 
 lr: 4e-5
 agc: 0.3

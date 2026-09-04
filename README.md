@@ -46,6 +46,18 @@ python3 train.py model.rep_loss=dreamer \
 These overrides may also be added directly under `model.loss_scales` in the
 model YAML. Heads without an explicit override continue to use `recon`.
 
+For bounded continuous control, the default actor is the Dreamer-style normal
+policy. A Beta policy over `[-1, 1]` can instead be selected with:
+
+```bash
+python3 train.py model.actor.dist.cont.name=beta
+```
+
+The Beta concentrations are parameterized above one so that evaluation uses a
+well-defined interior mode. They can be tuned with
+`model.actor.dist.cont.min_concentration` and
+`model.actor.dist.cont.max_concentration`.
+
 For easier code reading, inline tensor shape annotations are provided. See [`docs/tensor_shapes.md`](docs/tensor_shapes.md).
 
 

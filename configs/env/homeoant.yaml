@@ -3,12 +3,18 @@ task: 'homeoant_ant'
 # Use one environment for initial integration testing.
 steps: 3.0e6
 env_num: 16
-eval_episode_num: 0
+eval_episode_num: 5
+eval_max_steps: 60000
+eval_initial_bounds: 0.0
+survival_eval: true
 action_repeat: 1
 train_ratio: 32
 # Keep physiological-limit resets out of Dreamer's continuation target. Set to
 # true only when death should terminate returns.
 provide_terminal_signals: false
+# Match the homeostatic continuing-task formulation: reset episodes at the
+# physiological boundary without learning a state-dependent discount.
+fixed_continuation: true
 # time_limit: 1000
 
 seed: ${seed}

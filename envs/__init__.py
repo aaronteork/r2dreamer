@@ -9,12 +9,16 @@ def make_envs(config):
     if suite == "isaaclab":
         return _make_isaaclab_envs(config)
 
-    def env_constructor(idx):
-        return lambda: make_env(config, idx)
+    def env_constructor(idx, is_eval=False):
+        return lambda: make_env(config, idx, is_eval=is_eval)
 
     train_envs = parallel.ParallelEnv(env_constructor, config.env_num, config.device)
     eval_envs = (
-        parallel.ParallelEnv(env_constructor, config.eval_episode_num, config.device)
+        parallel.ParallelEnv(
+            lambda idx: env_constructor(idx, is_eval=True),
+            config.eval_episode_num,
+            config.device,
+        )
         if config.eval_episode_num > 0
         else None
     )
@@ -52,7 +56,7 @@ def _make_isaaclab_envs(config):
     return train_envs, eval_envs, obs_space, act_space
 
 
-def make_env(config, id):
+def make_env(config, id, is_eval=False):
     suite, task = config.task.split("_", 1)
     if suite == "dmc":
         import envs.dmc as dmc
@@ -109,12 +113,19 @@ def make_env(config, id):
             is_training=True,
             max_steps=float("inf"),
             image_size=tuple(config.size),
+            training_initial_bounds=(
+                float(getattr(config, "eval_initial_bounds", 0.0))
+                if is_eval
+                else float(getattr(config, "training_initial_bounds", 0.2))
+            ),
         )
 
         env = HomeostaticAntR2Env(
             ant_cfg,
             seed=config.seed + id,
             provide_terminal_signals=bool(getattr(config, "provide_terminal_signals", False)),
+            log_survival_metrics=is_eval
+            and bool(getattr(config, "survival_eval", False)),
         )
     else:
         raise NotImplementedError(suite)
