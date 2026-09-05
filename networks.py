@@ -350,8 +350,8 @@ class MLPHead(nn.Module):
         elif self._dist_name == "beta":
             self.last = nn.Linear(self.mlp.out_dim, config.shape[0] * 2, bias=True)
             kwargs = {
-                "min_concentration": float(config.dist.min_concentration),
-                "max_concentration": float(config.dist.max_concentration),
+                "min_concentration": float(config.dist.get("min_concentration", 1.0)),
+                "max_concentration": float(config.dist.get("max_concentration", 1000.0)),
             }
         elif self._dist_name == "onehot":
             self.last = nn.Linear(self.mlp.out_dim, config.shape[0], bias=True)
