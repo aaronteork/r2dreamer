@@ -100,6 +100,13 @@ class HomeostaticAntEnv(AntEnv, EzPickle):
         )
         if self.pov_camera_id == -1:
             raise ValueError("ant_env.xml must define a camera named 'pov'.")
+        if not 0.0 < self.cfg.camera_fovy < 180.0:
+            raise ValueError(
+                f"camera_fovy must be between 0 and 180 degrees, got {self.cfg.camera_fovy}."
+            )
+        # Keep the named camera in the XML, but make its FOV an experiment
+        # setting that can be overridden from Hydra at runtime.
+        self.model.cam_fovy[self.pov_camera_id] = self.cfg.camera_fovy
 
         # ------------ Observation and Action space ------------------
         # Create action space and observation space
@@ -493,13 +500,13 @@ class HomeostaticAntEnv(AntEnv, EzPickle):
         for obj in list(self.object):
             type_gen, x, y = obj
             if np.linalg.norm(ant_pos - np.array([x, y])) < self.cfg.object_interaction_dist:
-                if type_gen == "food" and self._is_in_front(np.array([x, y])):
+                if type_gen == "food" and self._is_in_camera_fov(np.array([x, y])):
                     self.hunger += self.cfg.replenish_rate
                     self.food_consumed += 1
                     self.object.remove(obj)
                     if not self.cfg.shift:
                         self.object.append(self._generate_new_object(type_gen))
-                elif type_gen == "water" and self._is_in_front(np.array([x, y])):
+                elif type_gen == "water" and self._is_in_camera_fov(np.array([x, y])):
                     self.thirst += self.cfg.replenish_rate
                     self.water_consumed += 1
                     self.object.remove(obj)
@@ -661,42 +668,50 @@ class HomeostaticAntEnv(AntEnv, EzPickle):
     def truncated(self):
         return self.current_step >= self.cfg.max_steps
 
-    def _is_in_front(self, target_pos, target_radius=RESOURCE_MARKER_RADIUS):
-        """Return whether any part of a resource lies in the POV horizontal FOV.
+    def _is_in_camera_fov(self, target_pos, target_radius=RESOURCE_MARKER_RADIUS):
+        """Return whether any part of a resource lies inside the POV frustum.
 
-        MuJoCo cameras look along their local ``-Z`` axis.  Deriving the
-        direction from ``cam_xmat`` keeps the interaction rule aligned with the
-        XML camera even if its mounting orientation changes.  This deliberately
-        checks the horizontal cone only: resource interaction is defined on the
-        arena plane, while the camera's vertical framing changes as the ant
-        pitches and rolls.  The rendered resources are spheres, so their
-        angular radius is included; otherwise a visibly protruding resource at
-        the image edge could not be consumed merely because its centre was just
-        outside the cone.
+        MuJoCo cameras look along local ``-Z``; local ``+X`` and ``+Y`` are the
+        image-right and image-up directions.  Test both rendered image axes so
+        pitching or rolling cannot allow consumption of a vertically invisible
+        resource.  The resource's angular radius is included because the
+        rendered resource is a sphere rather than a point.
         """
         camera_axes = self.data.cam_xmat[self.pov_camera_id].reshape(3, 3)
-        camera_forward_xy = -camera_axes[:, 2][:2]
-        forward_norm = np.linalg.norm(camera_forward_xy)
-        if forward_norm < 1e-6:
-            return False
-        camera_forward_xy /= forward_norm
+        camera_right = camera_axes[:, 0]
+        camera_up = camera_axes[:, 1]
+        camera_forward = -camera_axes[:, 2]
 
-        ant_pos = self.data.xpos[self.ant_body_id][:2]
-        target_direction = np.asarray(target_pos, dtype=np.float64)[:2] - ant_pos
-        target_distance = np.linalg.norm(target_direction)
+        target_pos = np.asarray(target_pos, dtype=np.float64)
+        if target_pos.shape == (2,):
+            target_pos = np.array(
+                [target_pos[0], target_pos[1], target_radius], dtype=np.float64
+            )
+        elif target_pos.shape != (3,):
+            raise ValueError(
+                f"target_pos must contain 2 or 3 coordinates, got shape {target_pos.shape}."
+            )
+
+        target_offset = target_pos - self.data.cam_xpos[self.pov_camera_id]
+        target_distance = np.linalg.norm(target_offset)
         if target_distance < 1e-6:
             return True
-        target_direction /= target_distance
+        target_direction = target_offset / target_distance
 
         # ``fovy`` is vertical.  Convert it to a horizontal FOV for the render
-        # aspect ratio so this condition follows the camera rather than a
-        # duplicated hard-coded angle.  The current 64x64 render makes both
-        # angles 120 degrees.
+        # aspect ratio so interaction follows the actual camera configuration.
         vertical_fov = np.deg2rad(self.model.cam_fovy[self.pov_camera_id])
-        width, height = self.cfg.image_size
+        height, width = self.cfg.image_size
         horizontal_fov = 2.0 * np.arctan(np.tan(vertical_fov / 2.0) * width / height)
         angular_radius = np.arcsin(min(1.0, max(0.0, target_radius) / target_distance))
+
+        forward_component = np.dot(camera_forward, target_direction)
+        right_component = np.dot(camera_right, target_direction)
+        up_component = np.dot(camera_up, target_direction)
+        horizontal_angle = np.arctan2(abs(right_component), forward_component)
+        vertical_angle = np.arctan2(abs(up_component), forward_component)
+
         return bool(
-            np.dot(camera_forward_xy, target_direction)
-            >= np.cos(horizontal_fov / 2.0 + angular_radius)
+            horizontal_angle <= horizontal_fov / 2.0 + angular_radius
+            and vertical_angle <= vertical_fov / 2.0 + angular_radius
         )

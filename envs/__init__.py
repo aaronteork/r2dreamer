@@ -113,6 +113,7 @@ def make_env(config, id, is_eval=False):
             is_training=True,
             max_steps=float("inf"),
             image_size=tuple(config.size),
+            camera_fovy=float(getattr(config, "camera_fovy", 90.0)),
             training_initial_bounds=(
                 float(getattr(config, "eval_initial_bounds", 0.0))
                 if is_eval

@@ -10,6 +10,7 @@ class EnvConfig(BaseConfig):
     max_steps: float = float("inf")
     eval_max_steps: int = 60_000
     image_size: tuple[int, int] = (64, 64)
+    camera_fovy: float = 90.0
     num_workers: int = 16
     # A coarse survival heartbeat is sufficient for cross-trainer comparisons
     # and avoids frequent synchronous SQLite writes.

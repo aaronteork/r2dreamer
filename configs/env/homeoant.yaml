@@ -21,6 +21,7 @@ seed: ${seed}
 device: ${device}
 
 size: [64, 64]
+camera_fovy: 90.0
 
 encoder:
   cnn_keys: 'image'
