@@ -382,3 +382,5 @@ class OnlineTrainer:
                 self.save_checkpoint(agent, step)
                 while step >= next_checkpoint:
                     next_checkpoint += self.checkpoint_every
+        if self.eval_episode_num > 0 and self.eval_envs is not None:
+            self.eval(agent, step)
