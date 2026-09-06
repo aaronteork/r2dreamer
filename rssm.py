@@ -12,6 +12,11 @@ class Deter(nn.Module):
         super().__init__()
         self.blocks = int(blocks)
         self.dynlayers = int(dynlayers)
+        self.hidden = int(hidden)
+        if deter % self.blocks:
+            raise ValueError(f"deter ({deter}) must be divisible by blocks ({self.blocks})")
+        if self.hidden % self.blocks:
+            raise ValueError(f"hidden ({self.hidden}) must be divisible by blocks ({self.blocks})")
         act = getattr(torch.nn, act)
         self._dyn_in0 = nn.Sequential(
             nn.Linear(deter, hidden, bias=True), nn.RMSNorm(hidden, eps=1e-04, dtype=torch.float32), act()
@@ -33,46 +38,64 @@ class Deter(nn.Module):
         self.flat2group = lambda x: x.reshape(*x.shape[:-1], self.blocks, -1)
         self.group2flat = lambda x: x.reshape(*x.shape[:-2], -1)
 
-    def forward(self, stoch, deter, action):
-        """Deterministic state transition (block-GRU style)."""
-        # (B, S, K), (B, D), (B, A)
+    def _project_inputs(self, stoch, deter, action):
+        """Project the recurrent state, stochastic state, and bounded action."""
         B = action.shape[0]
-
-        # Flatten stochastic state and normalize action magnitude.
-        # (B, S*K)
         stoch = stoch.reshape(B, -1)
         action = action / torch.clip(torch.abs(action), min=1.0).detach()
-        # (B, U)
         x0 = self._dyn_in0(deter)
         x1 = self._dyn_in1(stoch)
         x2 = self._dyn_in2(action)
+        return x0, x1, x2
 
-        # Concatenate projected inputs and broadcast over blocks.
-        # (B, 3*U)
+    def _gate_preactivations(self, deter, x0, x1, x2):
+        """Compute the existing DreamerV3 block-GRU gate preactivations."""
         x = torch.cat([x0, x1, x2], -1)
-        # (B, G, 3*U)
         x = x.unsqueeze(-2).expand(-1, self.blocks, -1)
-
-        # Combine per-block deterministic state with per-block inputs.
-        # (B, G, D/G + 3*U) -> (B, D + 3*U*G)
         x = self.group2flat(torch.cat([self.flat2group(deter), x], -1))
-
-        # (B, D)
         x = self._dyn_hid(x)
-        # (B, 3*D)
         x = self._dyn_gru(x)
-
-        # Split GRU-style gates block-wise.
-        # (B, G, 3*D/G)
         gates = torch.chunk(self.flat2group(x), 3, dim=-1)
+        return tuple(self.group2flat(gate) for gate in gates)
 
-        # (B, D)
-        reset, cand, update = (self.group2flat(x) for x in gates)
+    def _candidate(self, reset, cand, stoch_input, action_input):
+        return torch.tanh(reset * cand)
+
+    def forward(self, stoch, deter, action):
+        """Deterministic state transition (block-GRU style)."""
+        # (B, S, K), (B, D), (B, A)
+        x0, x1, x2 = self._project_inputs(stoch, deter, action)
+        reset, cand, update = self._gate_preactivations(deter, x0, x1, x2)
         reset = torch.sigmoid(reset)
-        cand = torch.tanh(reset * cand)
+        cand = self._candidate(reset, cand, x1, x2)
         update = torch.sigmoid(update - 1)
-        # (B, D)
         return update * cand + (1 - update) * deter
+
+
+class SRUDeter(Deter):
+    """DreamerV3 block-GRU enhanced with the SRU spatial transform.
+
+    The paper's current recurrent input is represented here by the learned
+    stochastic-state and action projections. The previous deterministic state
+    remains part of the ordinary GRU gates but is deliberately excluded from
+    the input-only spatial transformation.
+    """
+
+    def __init__(self, deter, stoch, act_dim, hidden, blocks, dynlayers, act="SiLU"):
+        super().__init__(deter, stoch, act_dim, hidden, blocks, dynlayers, act)
+        self._spatial_transform = BlockLinear(2 * self.hidden, deter, self.blocks)
+
+    def _spatial_term(self, stoch_input, action_input):
+        # Pair corresponding stochastic and action slices so each projection
+        # block sees both parts of the current transition-input latent.
+        grouped = torch.cat(
+            [self.flat2group(stoch_input), self.flat2group(action_input)], dim=-1
+        )
+        return self._spatial_transform(self.group2flat(grouped))
+
+    def _candidate(self, reset, cand, stoch_input, action_input):
+        spatial = self._spatial_term(stoch_input, action_input)
+        return torch.tanh(spatial * reset * cand)
 
 
 class RSSM(nn.Module):
@@ -91,9 +114,14 @@ class RSSM(nn.Module):
         self._img_layers = int(config.img_layers)
         self._dyn_layers = int(config.dyn_layers)
         self._blocks = int(config.blocks)
+        self._recurrent = str(getattr(config, "recurrent", "gru"))
+        recurrent_cores = {"gru": Deter, "sru": SRUDeter}
+        if self._recurrent not in recurrent_cores:
+            choices = ", ".join(recurrent_cores)
+            raise ValueError(f"rssm.recurrent must be one of {{{choices}}}, got {self._recurrent!r}")
         self.flat_stoch = self._stoch * self._discrete
         self.feat_size = self.flat_stoch + self._deter
-        self._deter_net = Deter(
+        self._deter_net = recurrent_cores[self._recurrent](
             self._deter,
             self.flat_stoch,
             act_dim,

@@ -149,11 +149,17 @@ def unpack_step_result(result: tuple[Any, ...]) -> tuple[dict[str, Any], float, 
 class GymnasiumEvaluationEnv(gym.Env):
     """Expose HomeostaticAntR2Env through Gymnasium's current vector API."""
 
-    def __init__(self, seed: int, image_size: tuple[int, int]):
+    def __init__(
+        self,
+        seed: int,
+        image_size: tuple[int, int],
+        camera_fovy: float,
+    ):
         self._env = HomeostaticAntR2Env(
             EnvConfig(
                 seed=seed,
                 image_size=image_size,
+                camera_fovy=camera_fovy,
                 is_training=True,
                 training_initial_bounds=0.0,
             ),
@@ -203,11 +209,15 @@ def observation_batch(
 def run_episode_batch(
     agent: Dreamer,
     image_size: tuple[int, int],
+    camera_fovy: float,
     seeds: list[int],
     max_steps: int,
 ) -> list[dict[str, Any]]:
     envs = gym.vector.AsyncVectorEnv(
-        [partial(GymnasiumEvaluationEnv, seed, image_size) for seed in seeds],
+        [
+            partial(GymnasiumEvaluationEnv, seed, image_size, camera_fovy)
+            for seed in seeds
+        ],
         context="spawn",
         autoreset_mode=gym.vector.AutoresetMode.NEXT_STEP,
     )
@@ -265,6 +275,7 @@ def evaluate_checkpoint(args: argparse.Namespace, step: int, checkpoint: Path, c
     set_seed_everywhere(args.seed)
     agent = load_agent(checkpoint, config, device)
     image_size = tuple(map(int, config.env.size))
+    camera_fovy = float(getattr(config.env, "camera_fovy", 90.0))
     configured_workers = int(getattr(config.env, "env_num", args.episodes))
     parallel_envs = min(args.parallel_envs or configured_workers, args.episodes)
     print(f"  Running {args.episodes} episodes with {parallel_envs} parallel workers.", flush=True)
@@ -272,7 +283,15 @@ def evaluate_checkpoint(args: argparse.Namespace, step: int, checkpoint: Path, c
     episodes = []
     for start in range(0, args.episodes, parallel_envs):
         batch_seeds = episode_seeds[start : start + parallel_envs]
-        episodes.extend(run_episode_batch(agent, image_size, batch_seeds, args.max_steps))
+        episodes.extend(
+            run_episode_batch(
+                agent,
+                image_size,
+                camera_fovy,
+                batch_seeds,
+                args.max_steps,
+            )
+        )
     lengths = np.asarray([episode["survival_steps"] for episode in episodes], dtype=np.float64)
     row = {
         "checkpoint_step": step, "checkpoint": str(checkpoint), "episodes": args.episodes,

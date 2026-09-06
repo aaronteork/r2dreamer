@@ -60,6 +60,7 @@ dreamer_pro:
     bilinear: True
 
 rssm:
+  recurrent: 'gru' # gru/sru
   stoch: 32
   deter: ${model.deter}
   hidden: ${model.hidden}
