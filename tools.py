@@ -125,8 +125,15 @@ def weight_init_(m, fan_type="in"):
     if weight.numel() == 0:
         return
 
-    # This is a torch private API, but widely used and stable.
-    in_num, out_num = nn_init._calculate_fan_in_and_fan_out(weight)
+    block_fan = getattr(m, "_block_fan", None)
+    if block_fan is not None:
+        # BlockLinear stores an additional block axis, but each output block is
+        # multiplied only by its matching input block. Use that true local fan
+        # rather than letting PyTorch count the block axis as a receptive field.
+        in_num, out_num = block_fan
+    else:
+        # This is a torch private API, but widely used and stable.
+        in_num, out_num = nn_init._calculate_fan_in_and_fan_out(weight)
 
     with torch.no_grad():
         fan = {"avg": (in_num + out_num) / 2, "in": in_num, "out": out_num}[fan_type]

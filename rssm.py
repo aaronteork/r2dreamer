@@ -34,7 +34,12 @@ class Deter(nn.Module):
             self._dyn_hid.add_module(f"norm_{i}", nn.RMSNorm(deter, eps=1e-04, dtype=torch.float32))
             self._dyn_hid.add_module(f"act_{i}", act())
             in_ch = deter
-        self._dyn_gru = BlockLinear(in_ch, 3 * deter, self.blocks)
+        # Reset and update gates can share the transition features. The
+        # candidate must be computed separately because an SRU-GRU applies the
+        # reset gate to the previous hidden state *before* the candidate map.
+        self._dyn_gates = BlockLinear(in_ch, 2 * deter, self.blocks)
+        candidate_in_ch = (2 * hidden + deter // self.blocks) * self.blocks
+        self._dyn_candidate = BlockLinear(candidate_in_ch, deter, self.blocks)
         self.flat2group = lambda x: x.reshape(*x.shape[:-1], self.blocks, -1)
         self.group2flat = lambda x: x.reshape(*x.shape[:-2], -1)
 
@@ -49,53 +54,63 @@ class Deter(nn.Module):
         return x0, x1, x2
 
     def _gate_preactivations(self, deter, x0, x1, x2):
-        """Compute the existing DreamerV3 block-GRU gate preactivations."""
+        """Compute reset and update preactivations from transition features."""
         x = torch.cat([x0, x1, x2], -1)
         x = x.unsqueeze(-2).expand(-1, self.blocks, -1)
         x = self.group2flat(torch.cat([self.flat2group(deter), x], -1))
         x = self._dyn_hid(x)
-        x = self._dyn_gru(x)
-        gates = torch.chunk(self.flat2group(x), 3, dim=-1)
+        x = self._dyn_gates(x)
+        gates = torch.chunk(self.flat2group(x), 2, dim=-1)
         return tuple(self.group2flat(gate) for gate in gates)
 
-    def _candidate(self, reset, cand, stoch_input, action_input):
-        return torch.tanh(reset * cand)
+    def _candidate_preactivation(self, deter, reset, stoch_input, action_input):
+        """Map current inputs and reset-gated previous state to a candidate."""
+        transition_input = torch.cat([stoch_input, action_input], dim=-1)
+        transition_input = transition_input.unsqueeze(-2).expand(-1, self.blocks, -1)
+        reset_deter = self.flat2group(reset * deter)
+        candidate_input = self.group2flat(
+            torch.cat([reset_deter, transition_input], dim=-1)
+        )
+        return self._dyn_candidate(candidate_input)
+
+    def _candidate(self, candidate_preactivation, stoch_input):
+        return torch.tanh(candidate_preactivation)
 
     def forward(self, stoch, deter, action):
         """Deterministic state transition (block-GRU style)."""
         # (B, S, K), (B, D), (B, A)
         x0, x1, x2 = self._project_inputs(stoch, deter, action)
-        reset, cand, update = self._gate_preactivations(deter, x0, x1, x2)
+        reset, update = self._gate_preactivations(deter, x0, x1, x2)
         reset = torch.sigmoid(reset)
-        cand = self._candidate(reset, cand, x1, x2)
+        cand = self._candidate_preactivation(deter, reset, x1, x2)
+        cand = self._candidate(cand, x1)
         update = torch.sigmoid(update - 1)
         return update * cand + (1 - update) * deter
 
 
 class SRUDeter(Deter):
-    """DreamerV3 block-GRU enhanced with the SRU spatial transform.
+    """Block-structured GRU enhanced with the SRU candidate modulation.
 
-    The paper's current recurrent input is represented here by the learned
-    stochastic-state and action projections. The previous deterministic state
-    remains part of the ordinary GRU gates but is deliberately excluded from
-    the input-only spatial transformation.
+    The spatial term is conditioned only on the learned stochastic-state
+    projection. Action remains in the ordinary transition and candidate paths,
+    while the previous deterministic state enters through the GRU gates and
+    reset-gated candidate path.
     """
 
     def __init__(self, deter, stoch, act_dim, hidden, blocks, dynlayers, act="SiLU"):
         super().__init__(deter, stoch, act_dim, hidden, blocks, dynlayers, act)
-        self._spatial_transform = BlockLinear(2 * self.hidden, deter, self.blocks)
+        # Every deterministic block receives a modulation derived from the full
+        # stochastic projection. Splitting the dense output afterwards retains
+        # block-structured recurrence without imposing block-isolated spatial
+        # inputs.
+        self._spatial_transform = nn.Linear(self.hidden, deter, bias=True)
 
-    def _spatial_term(self, stoch_input, action_input):
-        # Pair corresponding stochastic and action slices so each projection
-        # block sees both parts of the current transition-input latent.
-        grouped = torch.cat(
-            [self.flat2group(stoch_input), self.flat2group(action_input)], dim=-1
-        )
-        return self._spatial_transform(self.group2flat(grouped))
+    def _spatial_term(self, stoch_input):
+        return self._spatial_transform(stoch_input)
 
-    def _candidate(self, reset, cand, stoch_input, action_input):
-        spatial = self._spatial_term(stoch_input, action_input)
-        return torch.tanh(spatial * reset * cand)
+    def _candidate(self, candidate_preactivation, stoch_input):
+        spatial = self._spatial_term(stoch_input)
+        return torch.tanh(spatial * candidate_preactivation)
 
 
 class RSSM(nn.Module):

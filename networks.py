@@ -22,11 +22,7 @@ class LambdaLayer(nn.Module):
 
 
 class BlockLinear(nn.Module):
-    """Block-wise linear layer.
-
-    Weight layout is chosen to cooperate with PyTorch's fan-in/fan-out
-    calculation used by initializers.
-    """
+    """Block-wise linear layer with independent per-block fan metadata."""
 
     def __init__(self, in_ch: int, out_ch: int, blocks: int, outscale: float = 1.0):
         super().__init__()
@@ -34,8 +30,21 @@ class BlockLinear(nn.Module):
         self.out_ch = int(out_ch)
         self.blocks = int(blocks)
         self.outscale = float(outscale)
+        if self.in_ch % self.blocks:
+            raise ValueError(f"in_ch ({self.in_ch}) must be divisible by blocks ({self.blocks})")
+        if self.out_ch % self.blocks:
+            raise ValueError(f"out_ch ({self.out_ch}) must be divisible by blocks ({self.blocks})")
 
-        # Store weight in a layout that works with torch's fan calculation.
+        # ``weight_init_`` must use the fan of one independently multiplied
+        # block. PyTorch's generic fan calculation treats the final block axis
+        # as a convolutional receptive-field dimension and would therefore
+        # overestimate both fans by ``blocks``.
+        self._block_fan = (
+            self.in_ch // self.blocks,
+            self.out_ch // self.blocks,
+        )
+
+        # Store one matrix per independent block.
         # (O/G, I/G, G)
         self.weight = nn.Parameter(torch.empty(self.out_ch // self.blocks, self.in_ch // self.blocks, self.blocks))
         self.bias = nn.Parameter(torch.empty(self.out_ch))
