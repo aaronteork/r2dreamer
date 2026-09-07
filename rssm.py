@@ -73,35 +73,38 @@ class Deter(nn.Module):
 
 
 class SRUDeter(Deter):
-    """DreamerV3 block-GRU enhanced with a stable, bounded SRU spatial transform.
+    """DreamerV3 block-GRU with normalized SRU spatial modulation.
 
-    The spatial transformation gate is computed across all blocks of the transition
-    latent (stochastic state and ego-motion action) with bounded residual modulation
-    in (0, 2), starting at exact identity with the proven GRU baseline.
+    Features:
+    1. Identity-centered signed spatial modulation with learnable scalar scale alpha (spatial_scale).
+    2. Action removed from spatial input to prevent action-conditioned model exploitation in imagination.
+    3. Parameter-free per-block RMS normalization to control block-level activation energy.
+    4. Independently orthogonalized block projections.
     """
 
-    def __init__(self, deter, stoch, act_dim, hidden, blocks, dynlayers, act="SiLU"):
+    def __init__(self, deter, stoch, act_dim, hidden, blocks, dynlayers, act="SiLU", spatial_scale=0.1):
         super().__init__(deter, stoch, act_dim, hidden, blocks, dynlayers, act)
         self.deter = int(deter)
-        self._spatial_transform = BlockLinear(2 * self.hidden, deter, self.blocks)
+        self._spatial_transform = BlockLinear(self.hidden, deter, self.blocks)
+        self._spatial_norm = nn.RMSNorm(deter // self.blocks, eps=1e-04, elementwise_affine=False)
+        self.spatial_scale = nn.Parameter(torch.tensor(float(spatial_scale)))
         self.reset_spatial_parameters()
 
     def reset_spatial_parameters(self):
-        """Initialize to exact identity so training starts identical to the stable GRU."""
+        """Independently orthogonalize each block slice, zero bias, and initialize scale."""
         with torch.no_grad():
-            self._spatial_transform.weight.zero_()
+            for b in range(self.blocks):
+                nn.init.orthogonal_(self._spatial_transform.weight[:, :, b])
             self._spatial_transform.bias.zero_()
+            self.spatial_scale.fill_(0.1)
 
-    def _spatial_term(self, stoch_input, action_input):
-        grouped = torch.cat(
-            [self.flat2group(stoch_input), self.flat2group(action_input)], dim=-1
-        )
-        linear_out = self._spatial_transform(self.group2flat(grouped))
-        # Bounded strictly positive modulation in (0, 2), centered at 1.0
-        return 1.0 + torch.tanh(linear_out)
+    def _spatial_term(self, stoch_input):
+        raw = self._spatial_transform(stoch_input)
+        normed = self.group2flat(self._spatial_norm(self.flat2group(raw)))
+        return 1.0 + self.spatial_scale * normed
 
     def _candidate(self, reset, cand, stoch_input, action_input):
-        spatial = self._spatial_term(stoch_input, action_input)
+        spatial = self._spatial_term(stoch_input)
         return torch.tanh(spatial * reset * cand)
 
 

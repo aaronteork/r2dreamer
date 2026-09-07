@@ -114,8 +114,9 @@ def to_i32(x):
 def weight_init_(m, fan_type="in"):
     # RMSNorm: initialize scale to 1.
     if isinstance(m, nn.RMSNorm):
-        with torch.no_grad():
-            m.weight.fill_(1.0)
+        if m.weight is not None:
+            with torch.no_grad():
+                m.weight.fill_(1.0)
         return
 
     weight = getattr(m, "weight", None)

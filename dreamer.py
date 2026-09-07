@@ -463,6 +463,8 @@ class Dreamer(nn.Module):
         # log
         metrics["dyn_entropy"] = torch.mean(self.rssm.get_dist(prior_logit).entropy())
         metrics["rep_entropy"] = torch.mean(self.rssm.get_dist(post_logit).entropy())
+        if hasattr(self.rssm._deter_net, "spatial_scale"):
+            metrics["sru_spatial_scale"] = self.rssm._deter_net.spatial_scale.detach()
 
         # === Imagination rollout for actor-critic ===
         # (B*T, S, K), (B*T, D)
