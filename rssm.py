@@ -73,25 +73,32 @@ class Deter(nn.Module):
 
 
 class SRUDeter(Deter):
-    """DreamerV3 block-GRU enhanced with the SRU spatial transform.
+    """DreamerV3 block-GRU enhanced with a stable, bounded SRU spatial transform.
 
-    The paper's current recurrent input is represented here by the learned
-    stochastic-state and action projections. The previous deterministic state
-    remains part of the ordinary GRU gates but is deliberately excluded from
-    the input-only spatial transformation.
+    The spatial transformation gate is computed across all blocks of the transition
+    latent (stochastic state and ego-motion action) with bounded residual modulation
+    in (0, 2), starting at exact identity with the proven GRU baseline.
     """
 
     def __init__(self, deter, stoch, act_dim, hidden, blocks, dynlayers, act="SiLU"):
         super().__init__(deter, stoch, act_dim, hidden, blocks, dynlayers, act)
+        self.deter = int(deter)
         self._spatial_transform = BlockLinear(2 * self.hidden, deter, self.blocks)
+        self.reset_spatial_parameters()
+
+    def reset_spatial_parameters(self):
+        """Initialize to exact identity so training starts identical to the stable GRU."""
+        with torch.no_grad():
+            self._spatial_transform.weight.zero_()
+            self._spatial_transform.bias.zero_()
 
     def _spatial_term(self, stoch_input, action_input):
-        # Pair corresponding stochastic and action slices so each projection
-        # block sees both parts of the current transition-input latent.
         grouped = torch.cat(
             [self.flat2group(stoch_input), self.flat2group(action_input)], dim=-1
         )
-        return self._spatial_transform(self.group2flat(grouped))
+        linear_out = self._spatial_transform(self.group2flat(grouped))
+        # Bounded strictly positive modulation in (0, 2), centered at 1.0
+        return 1.0 + torch.tanh(linear_out)
 
     def _candidate(self, reset, cand, stoch_input, action_input):
         spatial = self._spatial_term(stoch_input, action_input)
@@ -157,6 +164,8 @@ class RSSM(nn.Module):
             LambdaLayer(lambda x: x.reshape(*x.shape[:-1], self._stoch, self._discrete)),
         )
         self.apply(weight_init_)
+        if isinstance(self._deter_net, SRUDeter):
+            self._deter_net.reset_spatial_parameters()
 
     def initial(self, batch_size):
         """Return an initial latent state."""
