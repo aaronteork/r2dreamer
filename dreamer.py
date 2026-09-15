@@ -78,6 +78,7 @@ class Dreamer(nn.Module):
 
         self._loss_scales = dict(config.loss_scales)
         self._log_grads = bool(config.log_grads)
+        self.reconstruction_log_scales = nn.ParameterDict()
 
         modules = {
             "rssm": self.rssm,
@@ -103,6 +104,13 @@ class Dreamer(nn.Module):
             for key in self.decoder.all_keys:
                 self._loss_scales.setdefault(key, recon)
             modules.update({"decoder": self.decoder})
+            if bool(getattr(config, "adaptive_reconstruction", False)):
+                # One global coefficient per modality; exp(-0) starts at one.
+                self.reconstruction_log_scales.update({
+                    key: nn.Parameter(torch.zeros((), device=self.device))
+                    for key in self.decoder.all_keys
+                })
+                modules["reconstruction_log_scales"] = self.reconstruction_log_scales
         elif self.rep_loss == "r2dreamer" or self.rep_loss == "infonce":
             # add projector for latent to embedding
             self.prj = Projector(self.rssm.feat_size, self.embed_size)
@@ -565,12 +573,33 @@ class Dreamer(nn.Module):
         metrics.update(tools.tensorstats(value, "value_replay"))
         metrics.update(tools.tensorstats(slow_value, "slow_value_replay"))
 
-        total_loss = sum([v * self._loss_scales[k] for k, v in losses.items()])
+        total_loss, reconstruction_metrics = self._aggregate_losses(losses)
+        metrics.update(reconstruction_metrics)
         self._scaler.scale(total_loss).backward()
 
         metrics.update({f"loss/{name}": loss for name, loss in losses.items()})
         metrics.update({"opt/loss": total_loss})
         return (post_stoch, post_deter), metrics
+
+    def _aggregate_losses(self, losses):
+        """Harmonize reconstruction only; preserve every other configured scale."""
+        terms = []
+        metrics = {}
+        for key, loss in losses.items():
+            if key in self.reconstruction_log_scales:
+                log_scale = self.reconstruction_log_scales[key].float()
+                coefficient = torch.exp(-log_scale)
+                regularizer = F.softplus(log_scale)
+                weighted_loss = coefficient * loss.float()
+                terms.append(weighted_loss + regularizer)
+                metrics.update({
+                    f"reconstruction/{key}/coefficient": coefficient.detach(),
+                    f"reconstruction/{key}/weighted_loss": weighted_loss.detach(),
+                    f"reconstruction/{key}/regularizer": regularizer.detach(),
+                })
+            else:
+                terms.append(loss * self._loss_scales[key])
+        return sum(terms), metrics
 
     @torch.no_grad()
     def _imagine(self, start, imag_horizon):

@@ -7,6 +7,10 @@ compile: True
 log_grads: False
 device: ${device}
 rep_loss: "r2dreamer" # r2dreamer/dreamer/infonce/dreamerpro
+# With rep_loss=dreamer, learn one reconstruction coefficient per observation
+# head, initialized at 1, using the existing optimizer and learning rate.
+# Set false for fixed reconstruction weights or legacy Dreamer checkpoints.
+adaptive_reconstruction: True
 # Continuing tasks can opt out of the learned continuation model. The
 # oc.select fallback keeps all existing environment configs terminal-aware.
 fixed_continuation: ${oc.select:env.fixed_continuation,false}
@@ -23,7 +27,8 @@ slow_target_fraction: 0.02
 
 loss_scales:
   # Default coefficient for all observation decoder heads. When rep_loss is
-  # "dreamer", add an observation key here to override its coefficient, e.g.:
+  # "dreamer" and adaptive_reconstruction is false, observation keys override it.
+  # Adaptive reconstruction replaces these fixed observation coefficients.
   proprioception: 1.0
   internal_state: 1.0
   image: 1.0
