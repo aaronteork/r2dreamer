@@ -261,9 +261,9 @@ class OnlineTrainer:
             ):
                 self.logger.scalar(f"episode/eval_{name}", summary[name])
             output_dir = self.logdir / "survival_evaluation"
-            _append_csv(output_dir / "final_survival_by_checkpoint.csv", [summary])
+            _append_csv(output_dir / "survival_by_checkpoint.csv", [summary])
             _append_csv(
-                output_dir / "final_survival_episodes_by_checkpoint.csv", episode_rows
+                output_dir / "survival_episodes_by_checkpoint.csv", episode_rows
             )
         if cache is not None and "image" in cache:
             self.logger.video("eval_video", tools.to_np(cache["image"][:1]))
