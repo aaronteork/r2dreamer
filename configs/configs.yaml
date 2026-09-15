@@ -27,7 +27,7 @@ buffer:
 trainer:
   steps: ${env.steps}
   pretrain: 0
-  eval_every: 2e5
+  eval_every: 3e5
   eval_episode_num: ${env.eval_episode_num}
   # A zero cap preserves the existing evaluator for other environments.
   eval_max_steps: ${oc.select:env.eval_max_steps,0}
@@ -41,5 +41,5 @@ trainer:
   update_log_every: 5e3
   # Set to a positive number of environment steps to retain periodic snapshots;
   # 0 disables periodic checkpointing (the final latest.pt is always saved).
-  checkpoint_every: 2e5
+  checkpoint_every: 3e5
   action_repeat: ${env.action_repeat}
