@@ -10,7 +10,7 @@ rep_loss: "r2dreamer" # r2dreamer/dreamer/infonce/dreamerpro
 # With rep_loss=dreamer, learn one reconstruction coefficient per observation
 # head, initialized at 1, using the existing optimizer and learning rate.
 # Set false for fixed reconstruction weights or legacy Dreamer checkpoints.
-adaptive_reconstruction: True
+adaptive_reconstruction: False
 # Continuing tasks can opt out of the learned continuation model. The
 # oc.select fallback keeps all existing environment configs terminal-aware.
 fixed_continuation: ${oc.select:env.fixed_continuation,false}
