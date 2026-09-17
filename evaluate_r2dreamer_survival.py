@@ -358,8 +358,8 @@ def main() -> None:
         episode_rows.extend(episodes)
     output_dir = args.output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
-    aggregate_path = output_dir / "final_final_survival_by_checkpoint.csv"
-    episodes_path = output_dir / "final_final_survival_episodes_by_checkpoint.csv"
+    aggregate_path = output_dir / "final_survival_by_checkpoint.csv"
+    episodes_path = output_dir / "final_survival_episodes_by_checkpoint.csv"
     mean_plot_path = output_dir / "mean_survival_by_checkpoint.png"
     median_plot_path = output_dir / "median_survival_by_checkpoint.png"
     write_csv(aggregate_path, rows)
