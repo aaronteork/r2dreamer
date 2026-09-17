@@ -570,7 +570,7 @@ class HomeostaticAntEnv(AntEnv, EzPickle):
         self.temperature = np.clip(self.temperature, -1.0, 1.0)
 
         homeo_reward = self.cfg.reward_scale * (self.prev_drive - current_drive)
-        movement_penalty = -self.cfg.movement_penalty_weight * action_magnitude**2
+        movement_penalty = -self.cfg.movement_penalty_weight * 0.5 * action_magnitude**2  # Added 0.5 to match trp
         posture_penalty = -self.cfg.posture_penalty_weight * self.posture**2
         physical_penalty = movement_penalty + posture_penalty
 
