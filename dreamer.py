@@ -513,7 +513,8 @@ class Dreamer(nn.Module):
         # (B*T, T_imag-1, 1)
         logpi = policy.log_prob(imag_action)[:, :-1].unsqueeze(-1)
         entropy = policy.entropy()[:, :-1].unsqueeze(-1)
-        losses["policy"] = torch.mean(weight[:, :-1].detach() * -(logpi * adv.detach() + self.act_entropy * entropy))
+        clipped_adv = torch.clamp(adv.detach(), -5.0, 5.0)
+        losses["policy"] = torch.mean(weight[:, :-1].detach() * -(logpi * clipped_adv + self.act_entropy * entropy))
 
         imag_value_dist = self.value(imag_feat)
         # (B*T, T_imag, 1)
