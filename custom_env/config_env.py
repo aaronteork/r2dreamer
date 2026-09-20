@@ -38,5 +38,5 @@ class EnvConfig(BaseConfig):
     posture_penalty_weight: float = 0.005
     reward_scale: float = 100.0
     render_mode: str = "rgb_array"
-    obs_space_dim: int = 27
+    obs_space_dim: int = 26
     action_space_dim: int = 8 if num_heat == 0 else 9

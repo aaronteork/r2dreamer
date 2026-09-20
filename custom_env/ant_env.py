@@ -349,10 +349,26 @@ class HomeostaticAntEnv(AntEnv, EzPickle):
         return np.array([direction[0], direction[1], 1.0], dtype=np.float32)
 
     def _get_obs(self):
-        # This is the basic proprioceptive observation from AntEnv
-        # OBS_SPACE_DIM shape about the body position, velocity, and joint angles
-        # Only take the original proprioceptive part, not the resource positions we added in the XML file
-        proprio_obs = AntEnv._get_obs(self)[:self.cfg.obs_space_dim]
+        # Use the current root quaternion directly, so the rotation and velocity
+        # refer to the same simulation state. R maps torso axes to world axes.
+        rotation = np.empty(9, dtype=np.float64)
+        # quat2Mat assumes a unit quaternion; normalize a copy without changing
+        # the simulator state.
+        torso_quat = self.data.qpos[3:7].copy()
+        mujoco.mju_normalize4(torso_quat)
+        mujoco.mju_quat2Mat(rotation, torso_quat)
+        world_to_body = rotation.reshape(3, 3).T
+        # Layout: height (1), body gravity (3), joint angles (8), body linear
+        # velocity (3), body angular velocity (3), joint velocities (8).
+        # MuJoCo free-joint angular qvel is already in the torso frame.
+        proprio_obs = np.concatenate((
+            self.data.qpos[2:3],
+            world_to_body @ np.array([0.0, 0.0, -1.0]),
+            self.data.qpos[7:15],
+            world_to_body @ self.data.qvel[:3],
+            self.data.qvel[3:6],
+            self.data.qvel[6:14],
+        )).astype(np.float32)
 
         # Render vision observations
         pov_image_rgb, pov_image_depth = self.mux_render(camera_name="pov")
