@@ -1,4 +1,7 @@
 act_entropy: 3e-4
+act_entropy_end: 3e-5
+act_entropy_start_step: 1500000
+act_entropy_end_step: 3000000
 kl_free: 1.0
 imag_horizon: 15
 horizon: 333

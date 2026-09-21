@@ -362,7 +362,7 @@ class OnlineTrainer:
                 else:
                     update_num = self._updates_needed(step)
                 for _ in range(update_num):
-                    _metrics = agent.update(self.replay_buffer)
+                    _metrics = agent.update(self.replay_buffer, step)
                     train_metrics = _metrics
                 update_count += update_num
                 # Log training metrics

@@ -33,7 +33,11 @@ class Dreamer(nn.Module):
     def __init__(self, config, obs_space, act_space):
         super().__init__()
         self.device = torch.device(config.device)
-        self.act_entropy = float(config.act_entropy)
+        self.act_entropy_start = float(config.act_entropy)
+        self.act_entropy = self.act_entropy_start
+        self.act_entropy_end = float(getattr(config, "act_entropy_end", self.act_entropy_start))
+        self.act_entropy_start_step = int(getattr(config, "act_entropy_start_step", 1500000))
+        self.act_entropy_end_step = int(getattr(config, "act_entropy_end_step", 2500000))
         self.kl_free = float(config.kl_free)
         self.imag_horizon = int(config.imag_horizon)
         self.horizon = int(config.horizon)
@@ -333,8 +337,17 @@ class Dreamer(nn.Module):
         error = (model - truth + 1.0) / 2.0
         return torch.cat([truth, model, error], 2)
 
-    def update(self, replay_buffer):
+    def update(self, replay_buffer, step=0):
         """Sample a batch from replay and perform one optimization step."""
+        if step < self.act_entropy_start_step:
+            self.act_entropy = self.act_entropy_start
+        elif step > self.act_entropy_end_step:
+            self.act_entropy = self.act_entropy_end
+        else:
+            step_range = max(1, self.act_entropy_end_step - self.act_entropy_start_step)
+            progress = (step - self.act_entropy_start_step) / step_range
+            self.act_entropy = self.act_entropy_start - progress * (self.act_entropy_start - self.act_entropy_end)
+
         data, index, initial = replay_buffer.sample()
         torch.compiler.cudagraph_mark_step_begin()
         p_data = self.preprocess(data)
