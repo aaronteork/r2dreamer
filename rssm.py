@@ -73,38 +73,35 @@ class Deter(nn.Module):
 
 
 class SRUDeter(Deter):
-    """DreamerV3 block-GRU with normalized SRU spatial modulation.
+    """DreamerV3 block-GRU with jointly conditioned SRU spatial modulation.
 
-    Features:
-    1. Identity-centered signed spatial modulation with learnable scalar scale alpha (spatial_scale).
-    2. Action removed from spatial input to prevent action-conditioned model exploitation in imagination.
-    3. Parameter-free per-block RMS normalization to control block-level activation energy.
-    4. Independently orthogonalized block projections.
+    Each block computes one affine multiplier from its projected previous
+    stochastic-state and action features: s = W_z e_z + W_a e_a + b.
+    The multiplier modulates the candidate before tanh in both observation
+    and imagination, without an extra normalization, offset, or learned scale.
     """
 
-    def __init__(self, deter, stoch, act_dim, hidden, blocks, dynlayers, act="SiLU", spatial_scale=0.1):
+    def __init__(self, deter, stoch, act_dim, hidden, blocks, dynlayers, act="SiLU"):
         super().__init__(deter, stoch, act_dim, hidden, blocks, dynlayers, act)
         self.deter = int(deter)
-        self._spatial_transform = BlockLinear(self.hidden, deter, self.blocks)
-        self._spatial_norm = nn.RMSNorm(deter // self.blocks, eps=1e-04, elementwise_affine=False)
-        self.spatial_scale = nn.Parameter(torch.tensor(float(spatial_scale)))
+        self._spatial_transform = BlockLinear(2 * self.hidden, deter, self.blocks)
         self.reset_spatial_parameters()
 
     def reset_spatial_parameters(self):
-        """Independently orthogonalize each block slice, zero bias, and initialize scale."""
+        """Independently orthogonalize each joint block projection and zero bias."""
         with torch.no_grad():
             for b in range(self.blocks):
                 nn.init.orthogonal_(self._spatial_transform.weight[:, :, b])
             self._spatial_transform.bias.zero_()
-            self.spatial_scale.fill_(0.1)
 
-    def _spatial_term(self, stoch_input):
-        raw = self._spatial_transform(stoch_input)
-        normed = self.group2flat(self._spatial_norm(self.flat2group(raw)))
-        return 1.0 + self.spatial_scale * normed
+    def _spatial_term(self, stoch_input, action_input):
+        # Concatenate within each block so every block receives both sources.
+        # Concatenating flat vectors first would give some blocks only one source.
+        joint = torch.cat([self.flat2group(stoch_input), self.flat2group(action_input)], dim=-1)
+        return self._spatial_transform(self.group2flat(joint))
 
     def _candidate(self, reset, cand, stoch_input, action_input):
-        spatial = self._spatial_term(stoch_input)
+        spatial = self._spatial_term(stoch_input, action_input)
         return torch.tanh(spatial * reset * cand)
 
 
