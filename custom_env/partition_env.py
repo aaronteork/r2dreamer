@@ -37,6 +37,8 @@ class PartitionRecallEnv(HomeostaticAntEnv):
             raise ValueError("camera_fovy must be between 0 and 180 degrees.")
         if not cfg.left_resource_sites or not cfg.right_resource_sites:
             raise ValueError("At least one resource site is required on each side.")
+        if cfg.partition_collision_padding < 0.0:
+            raise ValueError("partition_collision_padding cannot be negative.")
 
         xml_file_path = Path(__file__).parent / cfg.xml_path
         tree = ET.parse(xml_file_path)
@@ -103,6 +105,30 @@ class PartitionRecallEnv(HomeostaticAntEnv):
                     f"{cfg.partition_height / 2.0}"
                 ),
                 "rgba": "0.5 0.5 0.5 1",
+                "contype": "0",
+                "conaffinity": "0",
+                "condim": "3",
+            },
+        )
+        # Keep rendering unchanged while making contact early enough that the
+        # body-mounted camera cannot enter or near-clip through the wall.
+        ET.SubElement(
+            worldbody,
+            "geom",
+            {
+                "name": "partition_collision_shell",
+                "type": "box",
+                "pos": (
+                    f"{cfg.partition_x} {partition_y} "
+                    f"{cfg.partition_height / 2.0}"
+                ),
+                "size": (
+                    f"{cfg.partition_thickness / 2.0 + cfg.partition_collision_padding} "
+                    f"{partition_half_length + cfg.partition_collision_padding} "
+                    f"{cfg.partition_height / 2.0}"
+                ),
+                "rgba": "0 0 0 0",
+                "contype": "1",
                 "conaffinity": "1",
                 "condim": "3",
             },
@@ -135,6 +161,11 @@ class PartitionRecallEnv(HomeostaticAntEnv):
         self.partition_geom_id = mujoco.mj_name2id(
             self.model, mujoco.mjtObj.mjOBJ_GEOM, "partition_wall"
         )
+        self.partition_collision_geom_id = mujoco.mj_name2id(
+            self.model,
+            mujoco.mjtObj.mjOBJ_GEOM,
+            "partition_collision_shell",
+        )
 
         self.hunger = 0.0
         self.thirst = 0.0
@@ -157,6 +188,9 @@ class PartitionRecallEnv(HomeostaticAntEnv):
         self.initial_target_bearing_error_rad = float("nan")
         self.wall_contact_steps = 0
         self.second_leg_stall_steps = 0
+        self.minimum_camera_wall_distance = float("inf")
+        self.near_clip_risk_frames = 0
+        self.camera_inside_partition_frames = 0
         self._previous_ant_pos: np.ndarray | None = None
         self._initial_hunger = 0.0
         self._initial_thirst = 0.0
@@ -275,6 +309,9 @@ class PartitionRecallEnv(HomeostaticAntEnv):
         self.initial_target_bearing_error_rad = float("nan")
         self.wall_contact_steps = 0
         self.second_leg_stall_steps = 0
+        self.minimum_camera_wall_distance = float("inf")
+        self.near_clip_risk_frames = 0
+        self.camera_inside_partition_frames = 0
 
         primary = self.np_random.uniform(
             self.cfg.primary_need_low, self.cfg.primary_need_high
@@ -304,6 +341,7 @@ class PartitionRecallEnv(HomeostaticAntEnv):
         self.set_state(qpos, qvel)
         self.posture = self._get_posture()
         self._previous_ant_pos = self.data.xpos[self.ant_body_id][:2].copy()
+        self.minimum_camera_wall_distance = self._camera_partition_distance()
 
         left = self.cfg.left_resource_sites[
             int(self.np_random.integers(len(self.cfg.left_resource_sites)))
@@ -324,11 +362,30 @@ class PartitionRecallEnv(HomeostaticAntEnv):
         return self._get_obs()
 
     def _wall_contacting(self) -> bool:
+        partition_geoms = {
+            self.partition_geom_id,
+            self.partition_collision_geom_id,
+        }
         for index in range(self.data.ncon):
             contact = self.data.contact[index]
-            if self.partition_geom_id in (contact.geom1, contact.geom2):
+            if partition_geoms.intersection((contact.geom1, contact.geom2)):
                 return True
         return False
+
+    @property
+    def near_clip_distance(self) -> float:
+        """Current MuJoCo near-plane distance in world metres."""
+        return float(self.model.stat.extent * self.model.vis.map.znear)
+
+    def _camera_partition_distance(self) -> float:
+        """Signed 2-D distance from the camera to the visible partition."""
+        x, y = self.data.cam_xpos[self.pov_camera_id][:2]
+        xmin, xmax, ymin, ymax = self._wall_bounds
+        dx = max(xmin - x, 0.0, x - xmax)
+        dy = max(ymin - y, 0.0, y - ymax)
+        if dx > 0.0 or dy > 0.0:
+            return float(np.hypot(dx, dy))
+        return -float(min(x - xmin, xmax - x, y - ymin, ymax - y))
 
     def _target_bearing_error(
         self, ant_pos: np.ndarray, target: np.ndarray
@@ -366,6 +423,16 @@ class PartitionRecallEnv(HomeostaticAntEnv):
                 self.second_leg_stall_steps += 1
         if self._wall_contacting():
             self.wall_contact_steps += 1
+        camera_wall_distance = self._camera_partition_distance()
+        self.minimum_camera_wall_distance = min(
+            self.minimum_camera_wall_distance, camera_wall_distance
+        )
+        near_clip_risk = camera_wall_distance < self.near_clip_distance
+        camera_inside_partition = camera_wall_distance < 0.0
+        if near_clip_risk:
+            self.near_clip_risk_frames += 1
+        if camera_inside_partition:
+            self.camera_inside_partition_frames += 1
 
         for resource in list(self.object):
             kind, x, y = resource
@@ -497,6 +564,17 @@ class PartitionRecallEnv(HomeostaticAntEnv):
             "second_leg_path_efficiency": np.array(path_efficiency),
             "wall_contact_steps": np.array(self.wall_contact_steps),
             "second_leg_stall_steps": np.array(self.second_leg_stall_steps),
+            "camera_wall_distance": np.array(camera_wall_distance),
+            "minimum_camera_wall_distance": np.array(
+                self.minimum_camera_wall_distance
+            ),
+            "near_clip_distance": np.array(self.near_clip_distance),
+            "near_clip_risk": np.array(near_clip_risk),
+            "near_clip_risk_frames": np.array(self.near_clip_risk_frames),
+            "camera_inside_partition": np.array(camera_inside_partition),
+            "camera_inside_partition_frames": np.array(
+                self.camera_inside_partition_frames
+            ),
         }
         if not self.cfg.is_training:
             environment_rgb, _ = self.mux_render(camera_name="environment")

@@ -18,8 +18,11 @@ class PartitionConfig(EnvConfig):
     # half extents. The outer boundary is identical to the training arena.
     partition_x: float = 0.0
     partition_lower_end_y: float = -1.5
-    partition_thickness: float = 0.2
+    partition_thickness: float = 0.5
     partition_height: float = 2.0
+    # Collision-only padding keeps the protruding POV camera outside the
+    # visible wall and its approximately 0.25 m near clipping plane.
+    partition_collision_padding: float = 0.35
     path_clearance: float = 0.75
 
     # Fixed preview pose. The training camera faces body +X, so the torso is

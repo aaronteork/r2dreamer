@@ -493,6 +493,10 @@ def episode_summary(
         "initial_target_bearing_error_rad",
         "wall_contact_steps",
         "second_leg_stall_steps",
+        "minimum_camera_wall_distance",
+        "near_clip_distance",
+        "near_clip_risk_frames",
+        "camera_inside_partition_frames",
     ):
         if key in info:
             row[key] = scalar(info, key)
@@ -566,6 +570,21 @@ def evaluation_summary(
                 [row["second_resource_step"] >= 0 for row in first_collected]
             )
         ) if first_collected else 0.0
+    if any("minimum_camera_wall_distance" in row for row in rows):
+        result["mean_minimum_camera_wall_distance"] = float(
+            np.mean([row["minimum_camera_wall_distance"] for row in rows])
+        )
+        result["near_clip_risk_episode_rate"] = float(
+            np.mean([row["near_clip_risk_frames"] > 0 for row in rows])
+        )
+        result["camera_penetration_episode_rate"] = float(
+            np.mean(
+                [row["camera_inside_partition_frames"] > 0 for row in rows]
+            )
+        )
+        result["mean_partition_contact_steps"] = float(
+            np.mean([row["wall_contact_steps"] for row in rows])
+        )
     return result
 
 
@@ -645,6 +664,13 @@ def evaluate(
                 "second_leg_path_efficiency",
                 "wall_contact_steps",
                 "second_leg_stall_steps",
+                "camera_wall_distance",
+                "minimum_camera_wall_distance",
+                "near_clip_distance",
+                "near_clip_risk",
+                "near_clip_risk_frames",
+                "camera_inside_partition",
+                "camera_inside_partition_frames",
             ):
                 if key in info:
                     step_row[key] = scalar(info, key)
