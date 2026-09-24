@@ -20,6 +20,10 @@ Evaluate the internal-state shift task without recording video::
 Evaluate selective and sequential resource collection in the Y-maze::
 
     python eval.py --task ymaze --run-dir logdir/homeostatic-ant
+
+Evaluate zero-shot landmark recall in the partitioned open field::
+
+    python eval.py --task partition --run-dir logdir/homeostatic-ant
 """
 
 from __future__ import annotations
@@ -39,7 +43,9 @@ from tensordict import TensorDict
 
 from custom_env.ant_env import HomeostaticAntEnv
 from custom_env.config_env import EnvConfig
+from custom_env.config_partition import PartitionConfig
 from custom_env.config_ymaze import YMazeConfig
+from custom_env.partition_env import PartitionRecallEnv
 from custom_env.ymaze_env import YMazeTestEnv
 from dreamer import Dreamer
 from envs.homeostatic_ant import HomeostaticAntR2Env
@@ -55,7 +61,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Evaluate an R2Dreamer agent.")
     parser.add_argument(
         "--task",
-        choices=("forage", "shift", "ymaze"),
+        choices=("forage", "shift", "ymaze", "partition"),
         required=True,
         help="Evaluation task.",
     )
@@ -232,6 +238,40 @@ def make_ymaze_env(
     ymaze_config = YMazeConfig(**configured)
     return R2DreamerEnvAdapter(
         YMazeTestEnv(ymaze_config), seed=seed, policy_size=policy_size
+    )
+
+
+def make_partition_env(
+    config: Any,
+    *,
+    seed: int,
+    render_size: tuple[int, int] | None = None,
+) -> Any:
+    """Build the held-out partition task with the training observation contract."""
+    policy_size = tuple(map(int, config.env.size))
+    valid_fields = {field.name for field in fields(PartitionConfig)}
+    configured = {
+        key: value
+        for key, value in dict(config.env).items()
+        if key in valid_fields
+    }
+    configured.update(
+        seed=seed,
+        device=torch.device(config.model.device),
+        image_size=render_size or policy_size,
+        is_training=False,
+        num_food=1,
+        num_water=1,
+        num_heat=0,
+        obs_space_dim=26,
+        max_steps=10_000,
+        shift=False,
+    )
+    partition_config = PartitionConfig(**configured)
+    return R2DreamerEnvAdapter(
+        PartitionRecallEnv(partition_config),
+        seed=seed,
+        policy_size=policy_size,
     )
 
 
@@ -440,6 +480,22 @@ def episode_summary(
         row["correct_first_resource"] = int(
             bool(resources) and resources[0] == expected_first
         )
+    for key in (
+        "first_resource_step",
+        "second_resource_step",
+        "target_reacquisition_step",
+        "second_leg_latency",
+        "target_reacquisition_latency",
+        "second_leg_distance",
+        "occluded_second_leg_distance",
+        "shortest_second_leg_distance",
+        "second_leg_path_efficiency",
+        "initial_target_bearing_error_rad",
+        "wall_contact_steps",
+        "second_leg_stall_steps",
+    ):
+        if key in info:
+            row[key] = scalar(info, key)
     return row
 
 
@@ -485,6 +541,31 @@ def evaluation_summary(
             if "correct_first_resource" in row
         ]
         result["correct_first_resource_rate"] = float(np.mean(choices))
+    successful_recall = [
+        row
+        for row in rows
+        if row["outcome"] == "resources_collected"
+        and np.isfinite(row.get("second_leg_path_efficiency", np.nan))
+    ]
+    if successful_recall:
+        result["mean_successful_second_leg_path_efficiency"] = float(
+            np.mean(
+                [row["second_leg_path_efficiency"] for row in successful_recall]
+            )
+        )
+        result["mean_successful_second_leg_distance"] = float(
+            np.mean([row["second_leg_distance"] for row in successful_recall])
+        )
+    if any("first_resource_step" in row for row in rows):
+        first_collected = [row for row in rows if row["first_resource_step"] >= 0]
+        result["first_resource_collection_rate"] = float(
+            len(first_collected) / len(rows)
+        )
+        result["second_resource_given_first_rate"] = float(
+            np.mean(
+                [row["second_resource_step"] >= 0 for row in first_collected]
+            )
+        ) if first_collected else 0.0
     return result
 
 
@@ -546,17 +627,35 @@ def evaluate(
                 "heat_exposed_time",
                 "sweating",
                 "is_flipped",
+                "ant_x",
+                "ant_y",
+                "remaining_resource_x",
+                "remaining_resource_y",
+                "remaining_resource_visible",
+                "target_bearing_error_rad",
+                "initial_target_bearing_error_rad",
+                "first_resource_step",
+                "second_resource_step",
+                "target_reacquisition_step",
+                "second_leg_latency",
+                "target_reacquisition_latency",
+                "second_leg_distance",
+                "occluded_second_leg_distance",
+                "shortest_second_leg_distance",
+                "second_leg_path_efficiency",
+                "wall_contact_steps",
+                "second_leg_stall_steps",
             ):
                 if key in info:
                     step_row[key] = scalar(info, key)
             step_rows.append(step_row)
 
             resources_collected = (
-                task in {"shift", "ymaze"}
+                task in {"shift", "ymaze", "partition"}
                 and scalar(info, "food_consumed") >= 1
                 and scalar(info, "water_consumed") >= 1
             )
-            if resources_collected and (task == "ymaze" or not done):
+            if resources_collected and (task in {"ymaze", "partition"} or not done):
                 outcome = "resources_collected"
                 break
             if done:
@@ -602,6 +701,11 @@ def main() -> None:
     render_size = None if args.no_video else (args.video_size, args.video_size)
     if args.task == "ymaze":
         env = make_ymaze_env(
+            config, seed=args.seed, render_size=render_size
+        )
+        default_max_steps = int(env._env.cfg.max_steps)
+    elif args.task == "partition":
+        env = make_partition_env(
             config, seed=args.seed, render_size=render_size
         )
         default_max_steps = int(env._env.cfg.max_steps)
