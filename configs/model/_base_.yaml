@@ -35,6 +35,7 @@ loss_scales:
   proprioception: 1.0
   internal_state: 1.0
   image: 1.0
+  proprio_pred: 1.0
   barlow: 0.05
   infonce: 1.0
   recon: 1.0

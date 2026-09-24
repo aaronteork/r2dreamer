@@ -25,6 +25,10 @@ def _mask_invalid_imagination_starts(weight, is_last):
 
 def _select_replay_bootstrap(imag_boot, value, last, term):
     """Use the observed critic at reset-only boundaries, never post-reset imagination."""
+    if last.dim() < value.dim():
+        last = last.unsqueeze(-1)
+    if term.dim() < value.dim():
+        term = term.unsqueeze(-1)
     nonterminal_boundary = (last > 0.5) & (term < 0.5)
     return torch.where(nonterminal_boundary, value, imag_boot)
 
@@ -51,10 +55,12 @@ class Dreamer(nn.Module):
         shapes = {k: tuple(v.shape) for k, v in obs_space.spaces.items()}
         self.encoder = networks.MultiEncoder(config.encoder, shapes)
         self.embed_size = self.encoder.out_dim
+        proprio_dim = shapes.get("proprioception", (26,))[0] if "proprioception" in shapes else 26
         self.rssm = rssm.RSSM(
             config.rssm,
             self.embed_size,
             self.act_dim,
+            proprio_dim=proprio_dim,
         )
         self.reward = networks.MLPHead(config.reward, self.rssm.feat_size)
         self.cont = networks.MLPHead(config.cont, self.rssm.feat_size)
@@ -152,6 +158,12 @@ class Dreamer(nn.Module):
                 "ema_encoder": self._ema_encoder,
                 "ema_obs_proj": self._ema_obs_proj,
             })
+        if isinstance(self.rssm._deter_net, rssm.SRUDeter):
+            proprio_scale = float(self._loss_scales.get("proprioception", 1.0))
+            self._loss_scales.setdefault("proprio_pred", float(self._loss_scales.get("proprio_pred", proprio_scale)))
+            if bool(getattr(config, "adaptive_reconstruction", False)):
+                self.reconstruction_log_scales["proprio_pred"] = nn.Parameter(torch.zeros((), device=self.device))
+                modules["reconstruction_log_scales"] = self.reconstruction_log_scales
         # count number of parameters in each module
         for key, module in modules.items():
             if isinstance(module, nn.Parameter):
@@ -424,6 +436,12 @@ class Dreamer(nn.Module):
         dyn_loss, rep_loss = self.rssm.kl_loss(post_logit, prior_logit, self.kl_free)
         losses["dyn"] = torch.mean(dyn_loss)
         losses["rep"] = torch.mean(rep_loss)
+        if self.rssm.last_proprio_preds is not None and "proprioception" in data:
+            proprio_pred = self.rssm.last_proprio_preds
+            proprio_target = data["proprioception"]
+            proprio_loss = F.mse_loss(proprio_pred, proprio_target)
+            losses["proprio_pred"] = proprio_loss
+            metrics["proprio_pred_mse"] = proprio_loss.detach()
         # === Representation / auxiliary losses ===
         # (B, T, F)
         feat = self.rssm.get_feat(post_stoch, post_deter)

@@ -73,18 +73,40 @@ class Deter(nn.Module):
 
 
 class SRUDeter(Deter):
-    """DreamerV3 block-GRU with jointly conditioned SRU spatial modulation.
+    """DreamerV3 block-GRU with proprioception-conditioned SRU spatial modulation.
 
-    Each block computes one affine multiplier from its projected previous
-    stochastic-state and action features: s = W_z e_z + W_a e_a + b.
-    The multiplier modulates the candidate before tanh in both observation
-    and imagination, without an extra normalization, offset, or learned scale.
+    Predicts the forward proprioceptive transition from (deter, stoch, action)
+    using Dreamer's standard MLP architecture (Linear -> RMSNorm -> act -> Linear -> RMSNorm -> act -> Linear).
+    The predicted proprioception is projected to modulate the candidate state via
+    BlockLinear before tanh in both observation and imagination rollouts.
     """
 
-    def __init__(self, deter, stoch, act_dim, hidden, blocks, dynlayers, act="SiLU"):
+    def __init__(self, deter, stoch, act_dim, hidden, blocks, dynlayers, act="SiLU", proprio_dim=26):
         super().__init__(deter, stoch, act_dim, hidden, blocks, dynlayers, act)
         self.deter = int(deter)
-        self._spatial_transform = BlockLinear(2 * self.hidden, deter, self.blocks)
+        self.proprio_dim = int(proprio_dim)
+        act_fn = getattr(torch.nn, act)
+
+        # Forward proprioception predictor matching standard Dreamer MLP:
+        # Linear -> RMSNorm -> act -> Linear -> RMSNorm -> act -> Linear
+        self._proprio_pred = nn.Sequential(
+            nn.Linear(3 * self.hidden, self.hidden, bias=True),
+            nn.RMSNorm(self.hidden, eps=1e-04, dtype=torch.float32),
+            act_fn(),
+            nn.Linear(self.hidden, self.hidden, bias=True),
+            nn.RMSNorm(self.hidden, eps=1e-04, dtype=torch.float32),
+            act_fn(),
+            nn.Linear(self.hidden, self.proprio_dim, bias=True),
+        )
+
+        # Spatial transformation gate: projects full predicted proprioception into block modulation
+        self._spatial_in = nn.Sequential(
+            nn.Linear(self.proprio_dim, self.hidden, bias=True),
+            nn.RMSNorm(self.hidden, eps=1e-04, dtype=torch.float32),
+            act_fn(),
+        )
+        self._spatial_transform = BlockLinear(self.hidden, deter, self.blocks)
+        self._last_proprio_pred = None
         self.reset_spatial_parameters()
 
     def reset_spatial_parameters(self):
@@ -94,19 +116,30 @@ class SRUDeter(Deter):
                 nn.init.orthogonal_(self._spatial_transform.weight[:, :, b])
             self._spatial_transform.bias.zero_()
 
-    def _spatial_term(self, stoch_input, action_input):
-        # Concatenate within each block so every block receives both sources.
-        # Concatenating flat vectors first would give some blocks only one source.
-        joint = torch.cat([self.flat2group(stoch_input), self.flat2group(action_input)], dim=-1)
-        return self._spatial_transform(self.group2flat(joint))
+    def _spatial_term(self, proprio_pred):
+        spatial_feat = self._spatial_in(proprio_pred)
+        return self._spatial_transform(spatial_feat)
 
-    def _candidate(self, reset, cand, stoch_input, action_input):
-        spatial = self._spatial_term(stoch_input, action_input)
+    def _candidate(self, reset, cand, proprio_pred):
+        spatial = self._spatial_term(proprio_pred)
         return torch.tanh(spatial * reset * cand)
+
+    def forward(self, stoch, deter, action):
+        """Deterministic state transition with predicted proprioception modulation."""
+        x0, x1, x2 = self._project_inputs(stoch, deter, action)
+        proprio_input = torch.cat([x0, x1, x2], dim=-1)
+        proprio_pred = self._proprio_pred(proprio_input)
+        self._last_proprio_pred = proprio_pred
+
+        reset, cand, update = self._gate_preactivations(deter, x0, x1, x2)
+        reset = torch.sigmoid(reset)
+        cand = self._candidate(reset, cand, proprio_pred)
+        update = torch.sigmoid(update - 1)
+        return update * cand + (1 - update) * deter
 
 
 class RSSM(nn.Module):
-    def __init__(self, config, embed_size, act_dim):
+    def __init__(self, config, embed_size, act_dim, proprio_dim=26):
         super().__init__()
         self._stoch = int(config.stoch)
         self._deter = int(config.deter)
@@ -117,6 +150,7 @@ class RSSM(nn.Module):
         self._initial = str(config.initial)
         self._device = torch.device(config.device)
         self._act_dim = act_dim
+        self._proprio_dim = int(getattr(config, "proprio_dim", proprio_dim))
         self._obs_layers = int(config.obs_layers)
         self._img_layers = int(config.img_layers)
         self._dyn_layers = int(config.dyn_layers)
@@ -128,15 +162,18 @@ class RSSM(nn.Module):
             raise ValueError(f"rssm.recurrent must be one of {{{choices}}}, got {self._recurrent!r}")
         self.flat_stoch = self._stoch * self._discrete
         self.feat_size = self.flat_stoch + self._deter
-        self._deter_net = recurrent_cores[self._recurrent](
-            self._deter,
-            self.flat_stoch,
-            act_dim,
-            self._hidden,
+        kwargs = dict(
+            deter=self._deter,
+            stoch=self.flat_stoch,
+            act_dim=act_dim,
+            hidden=self._hidden,
             blocks=self._blocks,
             dynlayers=self._dyn_layers,
             act=config.act,
         )
+        if self._recurrent == "sru":
+            kwargs["proprio_dim"] = self._proprio_dim
+        self._deter_net = recurrent_cores[self._recurrent](**kwargs)
 
         self._obs_net = nn.Sequential()
         inp_dim = self._deter + embed_size
@@ -167,11 +204,16 @@ class RSSM(nn.Module):
         if isinstance(self._deter_net, SRUDeter):
             self._deter_net.reset_spatial_parameters()
 
+    @property
+    def last_proprio_preds(self):
+        return getattr(self, "_last_proprio_preds", None)
+
     def initial(self, batch_size):
         """Return an initial latent state."""
         # (B, D), (B, S, K)
         deter = torch.zeros(batch_size, self._deter, dtype=torch.float32, device=self._device)
         stoch = torch.zeros(batch_size, self._stoch, self._discrete, dtype=torch.float32, device=self._device)
+        self._last_proprio_preds = None
         return stoch, deter
 
     def observe(self, embed, action, initial, reset):
@@ -180,16 +222,24 @@ class RSSM(nn.Module):
         L = action.shape[1]
         stoch, deter = initial
         stochs, deters, logits = [], [], []
+        proprio_preds = []
+        is_sru = isinstance(self._deter_net, SRUDeter)
         for i in range(L):
             # (B, S, K), (B, D), (B, S, K)
             stoch, deter, logit = self.obs_step(stoch, deter, action[:, i], embed[:, i], reset[:, i])
             stochs.append(stoch)
             deters.append(deter)
             logits.append(logit)
+            if is_sru:
+                proprio_preds.append(self._deter_net._last_proprio_pred)
         # (B, T, S, K), (B, T, D), (B, T, S, K)
         stochs = torch.stack(stochs, dim=1)
         deters = torch.stack(deters, dim=1)
         logits = torch.stack(logits, dim=1)
+        if is_sru:
+            self._last_proprio_preds = torch.stack(proprio_preds, dim=1)
+        else:
+            self._last_proprio_preds = None
         return stochs, deters, logits
 
     def obs_step(self, stoch, deter, prev_action, embed, reset):
