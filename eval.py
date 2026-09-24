@@ -673,12 +673,12 @@ def evaluate(
                     else "homeostatic_termination"
                 )
                 break
-            if step % 100 == 0:
-                print(
-                    f"Episode {episode + 1}/{episodes}: step {step}/{max_steps}",
-                    end="\r",
-                    flush=True,
-                )
+            # if step % 100 == 0:
+            #     print(
+            #         f"Episode {episode + 1}/{episodes}: step {step}/{max_steps}",
+            #         end="\r",
+            #         flush=True,
+            #     )
 
         episode_rows.append(
             episode_summary(

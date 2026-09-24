@@ -442,10 +442,10 @@ class PartitionRecallEnv(HomeostaticAntEnv):
                 and self._resource_visible(resource)
             ):
                 if kind == "food":
-                    self.hunger += self.cfg.replenish_rate
+                    self.hunger = 0.0
                     self.food_consumed += 1
                 else:
-                    self.thirst += self.cfg.replenish_rate
+                    self.thirst = 0.0
                     self.water_consumed += 1
                 self.object.remove(resource)
                 self.resources_consumed.append(kind)

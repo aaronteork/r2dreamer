@@ -8,7 +8,7 @@ class PartitionConfig(EnvConfig):
     """Configuration for the zero-shot partitioned landmark-recall task."""
 
     env_name: str = "PartitionRecallEnv"
-    max_steps: int = 10_000
+    max_steps: int = 5_000
     num_food: int = 1
     num_water: int = 1
     num_heat: int = 0
@@ -17,12 +17,12 @@ class PartitionConfig(EnvConfig):
     # A vertical partition attached to the north wall. MuJoCo box sizes are
     # half extents. The outer boundary is identical to the training arena.
     partition_x: float = 0.0
-    partition_lower_end_y: float = -1.5
-    partition_thickness: float = 0.5
+    partition_lower_end_y: float = 0.0
+    partition_thickness: float = 0.2
     partition_height: float = 2.0
     # Collision-only padding keeps the protruding POV camera outside the
     # visible wall and its approximately 0.25 m near clipping plane.
-    partition_collision_padding: float = 0.35
+    partition_collision_padding: float = 0.0
     path_clearance: float = 0.75
 
     # Fixed preview pose. The training camera faces body +X, so the torso is
@@ -33,21 +33,15 @@ class PartitionConfig(EnvConfig):
     # Candidate sites vary the metric target position while retaining a wide,
     # symmetric arena. One site is sampled independently on each side.
     left_resource_sites: tuple[tuple[float, float], ...] = (
-        (-3.0, 2.5),
-        (-3.0, 3.5),
-        (-3.8, 2.5),
-        (-3.8, 3.5),
+        (-4.5, 2.5),
     )
     right_resource_sites: tuple[tuple[float, float], ...] = (
-        (3.0, 2.5),
-        (3.0, 3.5),
-        (3.8, 2.5),
-        (3.8, 3.5),
+        (4.5, 2.5),
     )
 
     # Initial needs match the held-out selective-foraging evaluation and lie
     # within the range encountered by the training environment.
-    primary_need_low: float = -0.15
-    primary_need_high: float = -0.11
-    secondary_need_low: float = -0.10
-    secondary_need_high: float = -0.05
+    primary_need_low: float = -0.5
+    primary_need_high: float = -0.4
+    secondary_need_low: float = -0.2
+    secondary_need_high: float = -0.1
