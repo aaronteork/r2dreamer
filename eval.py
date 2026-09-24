@@ -477,22 +477,18 @@ def episode_summary(
             else "water"
         )
         row["expected_first_resource"] = expected_first
+        expected_sequence = [
+            expected_first,
+            "water" if expected_first == "food" else "food",
+        ]
+        row["expected_resource_sequence"] = ">".join(expected_sequence)
         row["correct_first_resource"] = int(
             bool(resources) and resources[0] == expected_first
         )
+        row["second_resource_collected"] = int(len(resources) >= 2)
+        row["correct_resource_sequence"] = int(resources == expected_sequence)
     for key in (
-        "first_resource_step",
-        "second_resource_step",
-        "target_reacquisition_step",
-        "second_leg_latency",
-        "target_reacquisition_latency",
-        "second_leg_distance",
-        "occluded_second_leg_distance",
-        "shortest_second_leg_distance",
-        "second_leg_path_efficiency",
-        "initial_target_bearing_error_rad",
         "wall_contact_steps",
-        "second_leg_stall_steps",
         "minimum_camera_wall_distance",
         "near_clip_distance",
         "near_clip_risk_frames",
@@ -532,6 +528,13 @@ def evaluation_summary(
             np.mean([row["water_consumed"] for row in rows])
         ),
         "resource_collection_rate": float(
+            np.mean(
+                [
+                    row["food_consumed"] >= 1 and row["water_consumed"] >= 1
+                    for row in rows
+                ]
+            )
+        ) if task == "partition" else float(
             np.mean([row["outcome"] == "resources_collected" for row in rows])
         ),
         "survival_to_cutoff_rate": float(
@@ -539,52 +542,27 @@ def evaluation_summary(
         ),
     }
     if any("correct_first_resource" in row for row in rows):
-        choices = [
-            row["correct_first_resource"]
-            for row in rows
-            if "correct_first_resource" in row
-        ]
-        result["correct_first_resource_rate"] = float(np.mean(choices))
-    successful_recall = [
-        row
-        for row in rows
-        if row["outcome"] == "resources_collected"
-        and np.isfinite(row.get("second_leg_path_efficiency", np.nan))
-    ]
-    if successful_recall:
-        result["mean_successful_second_leg_path_efficiency"] = float(
-            np.mean(
-                [row["second_leg_path_efficiency"] for row in successful_recall]
+        result["first_resource_accuracy"] = float(
+            np.mean([row.get("correct_first_resource", 0) for row in rows])
+        )
+        result["second_resource_collection_rate"] = float(
+            np.mean([row.get("second_resource_collected", 0) for row in rows])
+        )
+        result["correct_sequence_success_rate"] = float(
+            np.mean([row.get("correct_resource_sequence", 0) for row in rows])
+        )
+    if task == "partition":
+        return {
+            key: result[key]
+            for key in (
+                "task",
+                "episodes",
+                "max_steps",
+                "first_resource_accuracy",
+                "second_resource_collection_rate",
+                "correct_sequence_success_rate",
             )
-        )
-        result["mean_successful_second_leg_distance"] = float(
-            np.mean([row["second_leg_distance"] for row in successful_recall])
-        )
-    if any("first_resource_step" in row for row in rows):
-        first_collected = [row for row in rows if row["first_resource_step"] >= 0]
-        result["first_resource_collection_rate"] = float(
-            len(first_collected) / len(rows)
-        )
-        result["second_resource_given_first_rate"] = float(
-            np.mean(
-                [row["second_resource_step"] >= 0 for row in first_collected]
-            )
-        ) if first_collected else 0.0
-    if any("minimum_camera_wall_distance" in row for row in rows):
-        result["mean_minimum_camera_wall_distance"] = float(
-            np.mean([row["minimum_camera_wall_distance"] for row in rows])
-        )
-        result["near_clip_risk_episode_rate"] = float(
-            np.mean([row["near_clip_risk_frames"] > 0 for row in rows])
-        )
-        result["camera_penetration_episode_rate"] = float(
-            np.mean(
-                [row["camera_inside_partition_frames"] > 0 for row in rows]
-            )
-        )
-        result["mean_partition_contact_steps"] = float(
-            np.mean([row["wall_contact_steps"] for row in rows])
-        )
+        }
     return result
 
 
@@ -646,24 +624,7 @@ def evaluate(
                 "heat_exposed_time",
                 "sweating",
                 "is_flipped",
-                "ant_x",
-                "ant_y",
-                "remaining_resource_x",
-                "remaining_resource_y",
-                "remaining_resource_visible",
-                "target_bearing_error_rad",
-                "initial_target_bearing_error_rad",
-                "first_resource_step",
-                "second_resource_step",
-                "target_reacquisition_step",
-                "second_leg_latency",
-                "target_reacquisition_latency",
-                "second_leg_distance",
-                "occluded_second_leg_distance",
-                "shortest_second_leg_distance",
-                "second_leg_path_efficiency",
                 "wall_contact_steps",
-                "second_leg_stall_steps",
                 "camera_wall_distance",
                 "minimum_camera_wall_distance",
                 "near_clip_distance",
@@ -682,7 +643,28 @@ def evaluate(
                 and scalar(info, "water_consumed") >= 1
             )
             if resources_collected and (task in {"ymaze", "partition"} or not done):
-                outcome = "resources_collected"
+                if task == "partition":
+                    resources = [
+                        str(resource)
+                        for resource in info.get("resources_consumed", [])
+                    ]
+                    expected_first = (
+                        "food"
+                        if scalar(info, "initial_hunger")
+                        < scalar(info, "initial_thirst")
+                        else "water"
+                    )
+                    expected_sequence = [
+                        expected_first,
+                        "water" if expected_first == "food" else "food",
+                    ]
+                    outcome = (
+                        "success"
+                        if resources == expected_sequence
+                        else "incorrect_resource_sequence"
+                    )
+                else:
+                    outcome = "resources_collected"
                 break
             if done:
                 outcome = (
