@@ -70,6 +70,7 @@ dreamer_pro:
 
 rssm:
   recurrent: 'gru' # gru/sru
+  spatial_modulation: true
   stoch: 32
   deter: ${model.deter}
   hidden: ${model.hidden}

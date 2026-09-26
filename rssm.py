@@ -81,10 +81,11 @@ class SRUDeter(Deter):
     BlockLinear before tanh in both observation and imagination rollouts.
     """
 
-    def __init__(self, deter, stoch, act_dim, hidden, blocks, dynlayers, act="SiLU", proprio_dim=26):
+    def __init__(self, deter, stoch, act_dim, hidden, blocks, dynlayers, act="SiLU", proprio_dim=26, spatial_modulation=True):
         super().__init__(deter, stoch, act_dim, hidden, blocks, dynlayers, act)
         self.deter = int(deter)
         self.proprio_dim = int(proprio_dim)
+        self.spatial_modulation = bool(spatial_modulation)
         act_fn = getattr(torch.nn, act)
 
         # Forward proprioception predictor matching standard Dreamer MLP:
@@ -100,17 +101,20 @@ class SRUDeter(Deter):
         )
 
         # Spatial transformation gate: projects full predicted proprioception into block modulation
-        self._spatial_in = nn.Sequential(
-            nn.Linear(self.proprio_dim, self.hidden, bias=True),
-            nn.RMSNorm(self.hidden, eps=1e-04, dtype=torch.float32),
-            act_fn(),
-        )
-        self._spatial_transform = BlockLinear(self.hidden, deter, self.blocks)
+        if self.spatial_modulation:
+            self._spatial_in = nn.Sequential(
+                nn.Linear(self.proprio_dim, self.hidden, bias=True),
+                nn.RMSNorm(self.hidden, eps=1e-04, dtype=torch.float32),
+                act_fn(),
+            )
+            self._spatial_transform = BlockLinear(self.hidden, deter, self.blocks)
+            self.reset_spatial_parameters()
         self._last_proprio_pred = None
-        self.reset_spatial_parameters()
 
     def reset_spatial_parameters(self):
         """Independently orthogonalize each joint block projection and zero bias."""
+        if not self.spatial_modulation:
+            return
         with torch.no_grad():
             for b in range(self.blocks):
                 nn.init.orthogonal_(self._spatial_transform.weight[:, :, b])
@@ -121,8 +125,11 @@ class SRUDeter(Deter):
         return self._spatial_transform(spatial_feat)
 
     def _candidate(self, reset, cand, proprio_pred):
-        spatial = self._spatial_term(proprio_pred)
-        return torch.tanh(spatial * reset * cand)
+        if self.spatial_modulation:
+            spatial = self._spatial_term(proprio_pred)
+            return torch.tanh(spatial * reset * cand)
+        else:
+            return torch.tanh(reset * cand)
 
     def forward(self, stoch, deter, action):
         """Deterministic state transition with predicted proprioception modulation."""
@@ -173,6 +180,7 @@ class RSSM(nn.Module):
         )
         if self._recurrent == "sru":
             kwargs["proprio_dim"] = self._proprio_dim
+            kwargs["spatial_modulation"] = getattr(config, "spatial_modulation", True)
         self._deter_net = recurrent_cores[self._recurrent](**kwargs)
 
         self._obs_net = nn.Sequential()
