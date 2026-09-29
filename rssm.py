@@ -85,6 +85,7 @@ class SRUDeter(Deter):
         super().__init__(deter, stoch, act_dim, hidden, blocks, dynlayers, act)
         self.deter = int(deter)
         self.proprio_dim = int(proprio_dim)
+        self.act_dim = int(act_dim)
         self.spatial_modulation = bool(spatial_modulation)
         act_fn = getattr(torch.nn, act)
 
@@ -103,32 +104,34 @@ class SRUDeter(Deter):
         # Spatial transformation gate: projects full predicted proprioception into block modulation
         if self.spatial_modulation:
             self._spatial_in = nn.Sequential(
-                nn.Linear(self.proprio_dim, self.hidden, bias=True),
+                nn.Linear(self.proprio_dim + self.act_dim, self.hidden, bias=True),
                 nn.RMSNorm(self.hidden, eps=1e-04, dtype=torch.float32),
                 act_fn(),
             )
             self._spatial_transform = BlockLinear(self.hidden, deter, self.blocks)
             self.reset_spatial_parameters()
         self._last_proprio_pred = None
+        self._last_spatial = None
 
     def reset_spatial_parameters(self):
-        """Independently orthogonalize each joint block projection and zero bias."""
         if not self.spatial_modulation:
             return
         with torch.no_grad():
-            for b in range(self.blocks):
-                nn.init.orthogonal_(self._spatial_transform.weight[:, :, b])
-            self._spatial_transform.bias.zero_()
+            self._spatial_transform.weight.zero_()
+            self._spatial_transform.bias.fill_(1.0)
 
-    def _spatial_term(self, proprio_pred):
-        spatial_feat = self._spatial_in(proprio_pred)
+    def _spatial_term(self, proprio_pred, action_input):
+        spatial_feat = torch.cat([proprio_pred, action_input], dim=-1)
+        spatial_feat = self._spatial_in(spatial_feat)
         return self._spatial_transform(spatial_feat)
 
-    def _candidate(self, reset, cand, proprio_pred):
+    def _candidate(self, reset, cand, proprio_pred, action_input):
         if self.spatial_modulation:
-            spatial = self._spatial_term(proprio_pred)
+            spatial = self._spatial_term(proprio_pred, action_input)
+            self._last_spatial = spatial.detach()
             return torch.tanh(spatial * reset * cand)
         else:
+            self._last_spatial = None
             return torch.tanh(reset * cand)
 
     def forward(self, stoch, deter, action):
@@ -140,7 +143,7 @@ class SRUDeter(Deter):
 
         reset, cand, update = self._gate_preactivations(deter, x0, x1, x2)
         reset = torch.sigmoid(reset)
-        cand = self._candidate(reset, cand, proprio_pred)
+        cand = self._candidate(reset, cand, proprio_pred, action)
         update = torch.sigmoid(update - 1)
         return update * cand + (1 - update) * deter
 
@@ -211,6 +214,11 @@ class RSSM(nn.Module):
         self.apply(weight_init_)
         if isinstance(self._deter_net, SRUDeter):
             self._deter_net.reset_spatial_parameters()
+        self._last_spatial_terms = None
+
+    @property
+    def last_spatial_terms(self):
+        return self._last_spatial_terms
 
     @property
     def last_proprio_preds(self):
@@ -222,6 +230,7 @@ class RSSM(nn.Module):
         deter = torch.zeros(batch_size, self._deter, dtype=torch.float32, device=self._device)
         stoch = torch.zeros(batch_size, self._stoch, self._discrete, dtype=torch.float32, device=self._device)
         self._last_proprio_preds = None
+        self._last_spatial_terms = None
         return stoch, deter
 
     def observe(self, embed, action, initial, reset):
@@ -231,7 +240,9 @@ class RSSM(nn.Module):
         stoch, deter = initial
         stochs, deters, logits = [], [], []
         proprio_preds = []
+        spatial_terms = []
         is_sru = isinstance(self._deter_net, SRUDeter)
+        track_spatial = is_sru and self._deter_net.spatial_modulation
         for i in range(L):
             # (B, S, K), (B, D), (B, S, K)
             stoch, deter, logit = self.obs_step(stoch, deter, action[:, i], embed[:, i], reset[:, i])
@@ -240,6 +251,8 @@ class RSSM(nn.Module):
             logits.append(logit)
             if is_sru:
                 proprio_preds.append(self._deter_net._last_proprio_pred)
+            if track_spatial:
+                spatial_terms.append(self._deter_net._last_spatial)
         # (B, T, S, K), (B, T, D), (B, T, S, K)
         stochs = torch.stack(stochs, dim=1)
         deters = torch.stack(deters, dim=1)
@@ -248,6 +261,7 @@ class RSSM(nn.Module):
             self._last_proprio_preds = torch.stack(proprio_preds, dim=1)
         else:
             self._last_proprio_preds = None
+        self._last_spatial_terms = torch.stack(spatial_terms, dim=1) if track_spatial else None
         return stochs, deters, logits
 
     def obs_step(self, stoch, deter, prev_action, embed, reset):

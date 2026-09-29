@@ -442,6 +442,11 @@ class Dreamer(nn.Module):
             proprio_loss = F.mse_loss(proprio_pred, proprio_target)
             losses["proprio_pred"] = proprio_loss
             metrics["proprio_pred_mse"] = proprio_loss.detach()
+            spatial_terms = self.rssm.last_spatial_terms
+            if spatial_terms is not None:
+                metrics["spatial_mean"] = spatial_terms.mean()
+                metrics["spatial_std"] = spatial_terms.std(unbiased=False)
+                metrics["spatial_abs_dev_from_1"] = (spatial_terms - 1.0).abs().mean()
         # === Representation / auxiliary losses ===
         # (B, T, F)
         feat = self.rssm.get_feat(post_stoch, post_deter)
