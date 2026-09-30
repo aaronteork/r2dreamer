@@ -12,12 +12,21 @@ def make_envs(config):
     def env_constructor(idx, is_eval=False):
         return lambda: make_env(config, idx, is_eval=is_eval)
 
-    train_envs = parallel.ParallelEnv(env_constructor, config.env_num, config.device)
+    transition_info_specs = (
+        {"ego_motion": ((6,), "float32")} if suite == "homeoant" else None
+    )
+    train_envs = parallel.ParallelEnv(
+        env_constructor,
+        config.env_num,
+        config.device,
+        transition_info_specs=transition_info_specs,
+    )
     eval_envs = (
         parallel.ParallelEnv(
             lambda idx: env_constructor(idx, is_eval=True),
             config.eval_episode_num,
             config.device,
+            transition_info_specs=transition_info_specs,
         )
         if config.eval_episode_num > 0
         else None

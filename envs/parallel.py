@@ -12,12 +12,14 @@ import torch
 from tensordict import TensorDict
 
 import tools
+from custom_env.transition_info import stack_transition_info
 
 
 class ParallelEnv:
-    def __init__(self, constructor, env_num, device):
+    def __init__(self, constructor, env_num, device, transition_info_specs=None):
         self.envs = [Parallel(constructor(i), "process") for i in range(env_num)]
         self.device = device
+        self.transition_info_specs = transition_info_specs or {}
 
     @property
     def observation_space(self):
@@ -58,21 +60,30 @@ class ParallelEnv:
             e.reset(seed=int(seed)) if d and seed is not None else e.reset() if d else e.step(a)
             for e, a, d, seed in zip(self.envs, action_np, done, reset_seeds)
         ]
-        new_o, new_r, new_d = [], [], []
+        new_o, new_r, new_d, new_info = [], [], [], []
         for p, d in zip(promise, done):
             if d:
                 new_o.append(p())
                 new_r.append(0.0)
                 new_d.append(False)
+                # Reset records have no preceding within-episode transition.
+                new_info.append({})
             else:
-                o, r, d, _ = p()
+                o, r, d, info = p()
                 new_o.append(o)
                 new_r.append(r)
                 new_d.append(d)
+                new_info.append(info)
         obs_stacked = {k: np.stack([o[k] for o in new_o]) for k in new_o[0].keys()}
+        transition_info = stack_transition_info(
+            new_info, self.transition_info_specs
+        )
 
         # Build CPU tensors first to avoid implicit GPU syncs and enable async H2D in caller.
-        obs_tensors = {k: torch.as_tensor(v, device="cpu") for k, v in obs_stacked.items()}
+        obs_tensors = {
+            k: torch.as_tensor(v, device="cpu")
+            for k, v in {**obs_stacked, **transition_info}.items()
+        }
         rew_stacked = torch.as_tensor(new_r, dtype=torch.float32, device="cpu")
 
         # Keep data on CPU; caller will .to(device, non_blocking=True) after pinning.

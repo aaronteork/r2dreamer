@@ -11,10 +11,10 @@ from gymnasium.envs.mujoco.ant_v5 import AntEnv
 from gymnasium.utils import EzPickle
 
 from custom_env.config_env import EnvConfig
+from custom_env.ego_motion import compute_ego_motion
 
 DEFAULT_CAMERA_CONFIG = {}
 RESOURCE_MARKER_RADIUS = 0.5
-
 
 def qtoeuler(q):
     """ quaternion to Euler angle
@@ -89,6 +89,9 @@ class HomeostaticAntEnv(AntEnv, EzPickle):
         self.thirst = 0.0
         self.temperature = 0.0
         self.prev_drive = 0.0
+        self._ego_motion = np.zeros(6, dtype=np.float32)
+        self._previous_torso_position = None
+        self._previous_torso_rotation = None
 
         # Track resources and agent
         self.object= []
@@ -212,6 +215,7 @@ class HomeostaticAntEnv(AntEnv, EzPickle):
             )
         self.set_state(qpos, qvel)
         self.posture = self._get_posture()
+        self._reset_ego_motion_tracking()
 
         # ------------------- Reset resources ------------------- #
         self.object = []
@@ -284,6 +288,22 @@ class HomeostaticAntEnv(AntEnv, EzPickle):
         # Using Euler angles (roll, pitch) to calculate tilt
         # data.qpos[3:7] is torso orientation (w, x, y, z)
         return np.linalg.norm(qtoeuler(self.data.qpos[3:7])[:2] - qtoeuler([1.0, 0.0, 0.0, 0.0])[:2])
+
+    def _get_torso_pose(self):
+        """Return torso world position and body-to-world rotation."""
+        rotation = np.empty(9, dtype=np.float64)
+        torso_quat = self.data.qpos[3:7].copy()
+        mujoco.mju_normalize4(torso_quat)
+        mujoco.mju_quat2Mat(rotation, torso_quat)
+        return self.data.qpos[:3].copy(), rotation.reshape(3, 3).copy()
+
+    def _reset_ego_motion_tracking(self):
+        """Start a new episode without creating a cross-reset transition."""
+        (
+            self._previous_torso_position,
+            self._previous_torso_rotation,
+        ) = self._get_torso_pose()
+        self._ego_motion = np.zeros(6, dtype=np.float32)
 
     def _generate_new_object(self, type_gen):
         existing = set()
@@ -485,7 +505,19 @@ class HomeostaticAntEnv(AntEnv, EzPickle):
             sweat_action = action[8]
 
         # Apply physical action and simulate
+        previous_position, previous_rotation = self._get_torso_pose()
+        self._previous_torso_position = previous_position
+        self._previous_torso_rotation = previous_rotation
         self.do_simulation(physical_action, self.frame_skip)
+        current_position, current_rotation = self._get_torso_pose()
+        self._ego_motion = compute_ego_motion(
+            self._previous_torso_position,
+            self._previous_torso_rotation,
+            current_position,
+            current_rotation,
+        )
+        self._previous_torso_position = current_position
+        self._previous_torso_rotation = current_rotation
         self.current_step += 1
         self.posture = self._get_posture()
 
@@ -614,6 +646,7 @@ class HomeostaticAntEnv(AntEnv, EzPickle):
             "reward_homeostatic": np.array(homeo_reward),
             "reward_movement_penalty": np.array(movement_penalty),
             "reward_posture_penalty": np.array(posture_penalty),
+            "ego_motion": self._ego_motion.copy(),
         }
 
         # info = {
