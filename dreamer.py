@@ -33,6 +33,38 @@ def _select_replay_bootstrap(imag_boot, value, last, term):
     return torch.where(nonterminal_boundary, value, imag_boot)
 
 
+def _motion_valid_mask(reference, is_first):
+    valid = 1.0 - to_f32(is_first)
+    while valid.dim() < reference.dim():
+        valid = valid.unsqueeze(-1)
+    return valid.expand_as(reference)
+
+
+def _masked_mean(values, mask):
+    mask = mask.expand_as(values)
+    return (values * mask).sum() / mask.sum().clamp_min(1.0)
+
+
+def _masked_extreme(values, mask, *, maximum):
+    mask = mask.expand_as(values).bool()
+    fill = -torch.inf if maximum else torch.inf
+    masked = torch.where(mask, values, torch.full_like(values, fill))
+    extreme = masked.max() if maximum else masked.min()
+    return torch.where(mask.any(), extreme, torch.zeros_like(extreme))
+
+
+def _masked_motion_mse(prediction, target, is_first):
+    """MSE over real transitions, excluding synthetic episode-reset rows."""
+    if prediction.shape != target.shape or prediction.shape[-1] != 6:
+        raise ValueError(
+            "motion prediction and target must have identical (..., 6) shapes, "
+            f"got {tuple(prediction.shape)} and {tuple(target.shape)}"
+        )
+    valid = _motion_valid_mask(prediction, is_first)
+    squared_error = (prediction - target).square()
+    return (squared_error * valid).sum() / valid.sum().clamp_min(1.0)
+
+
 class Dreamer(nn.Module):
     def __init__(self, config, obs_space, act_space):
         super().__init__()
@@ -50,6 +82,7 @@ class Dreamer(nn.Module):
         self.act_dim = act_space.n if hasattr(act_space, "n") else sum(act_space.shape)
         self.rep_loss = str(config.rep_loss)
         self.fixed_continuation = bool(getattr(config, "fixed_continuation", False))
+        self.motion_loss_scale = float(getattr(config, "motion_loss_scale", 1.0))
 
         # World model components
         shapes = {k: tuple(v.shape) for k, v in obs_space.spaces.items()}
@@ -164,6 +197,8 @@ class Dreamer(nn.Module):
             if bool(getattr(config, "adaptive_reconstruction", False)):
                 self.reconstruction_log_scales["proprio_pred"] = nn.Parameter(torch.zeros((), device=self.device))
                 modules["reconstruction_log_scales"] = self.reconstruction_log_scales
+        if isinstance(self.rssm._deter_net, rssm.MotionSRUDeter):
+            self._loss_scales["motion"] = self.motion_loss_scale
         # count number of parameters in each module
         for key, module in modules.items():
             if isinstance(module, nn.Parameter):
@@ -447,6 +482,72 @@ class Dreamer(nn.Module):
                 metrics["spatial_mean"] = spatial_terms.mean()
                 metrics["spatial_std"] = spatial_terms.std(unbiased=False)
                 metrics["spatial_abs_dev_from_1"] = (spatial_terms - 1.0).abs().mean()
+        if self.rssm.last_motion_preds is not None:
+            if "ego_motion" not in data:
+                raise KeyError(
+                    "motion-SRU training requires replay key 'ego_motion'; "
+                    "ground truth is used only by this auxiliary loss"
+                )
+            motion_pred = self.rssm.last_motion_preds
+            motion_target = to_f32(data["ego_motion"])
+            motion_loss = _masked_motion_mse(
+                motion_pred, motion_target, data["is_first"]
+            )
+            losses["motion"] = motion_loss
+            metrics["motion_loss"] = motion_loss.detach()
+            metrics["motion_loss_scaled"] = (
+                motion_loss.detach() * self.motion_loss_scale
+            )
+            motion_pred_detached = motion_pred.detach()
+            motion_target_detached = motion_target.detach()
+            valid = _motion_valid_mask(
+                motion_pred_detached, data["is_first"]
+            )
+            pred_mean = _masked_mean(motion_pred_detached, valid)
+            target_mean = _masked_mean(motion_target_detached, valid)
+            metrics["motion_pred_mean"] = pred_mean
+            metrics["motion_pred_std"] = torch.sqrt(
+                _masked_mean((motion_pred_detached - pred_mean).square(), valid)
+            )
+            metrics["motion_target_mean"] = target_mean
+            metrics["motion_target_std"] = torch.sqrt(
+                _masked_mean((motion_target_detached - target_mean).square(), valid)
+            )
+            absolute_error = (motion_pred_detached - motion_target_detached).abs()
+            metrics["translation_prediction_error"] = _masked_mean(
+                absolute_error[..., :3], valid[..., :3]
+            )
+            metrics["rotation_prediction_error"] = _masked_mean(
+                absolute_error[..., 3:], valid[..., 3:]
+            )
+            for index, name in enumerate(
+                ("delta_x", "delta_y", "delta_z", "rot_x", "rot_y", "rot_z")
+            ):
+                metrics[f"motion_error/{name}"] = _masked_mean(
+                    absolute_error[..., index], valid[..., index]
+                )
+
+            spatial_terms = self.rssm.last_spatial_terms
+            if spatial_terms is not None:
+                spatial_valid = _motion_valid_mask(
+                    spatial_terms, data["is_first"]
+                )
+                spatial_mean = _masked_mean(spatial_terms, spatial_valid)
+                metrics["spatial_mean"] = spatial_mean
+                metrics["spatial_std"] = torch.sqrt(
+                    _masked_mean(
+                        (spatial_terms - spatial_mean).square(), spatial_valid
+                    )
+                )
+                metrics["spatial_min"] = _masked_extreme(
+                    spatial_terms, spatial_valid, maximum=False
+                )
+                metrics["spatial_max"] = _masked_extreme(
+                    spatial_terms, spatial_valid, maximum=True
+                )
+                metrics["spatial_abs_dev_from_1"] = _masked_mean(
+                    (spatial_terms - 1.0).abs(), spatial_valid
+                )
         # === Representation / auxiliary losses ===
         # (B, T, F)
         feat = self.rssm.get_feat(post_stoch, post_deter)

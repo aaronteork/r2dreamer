@@ -17,6 +17,10 @@ adaptive_reconstruction: False
 # Continuing tasks can opt out of the learned continuation model. The
 # oc.select fallback keeps all existing environment configs terminal-aware.
 fixed_continuation: ${oc.select:env.fixed_continuation,false}
+# Conservative default preserves the exact vanilla RSSM/checkpoint structure.
+use_motion_sru: false
+# Multiplier for the raw 6-D ego-motion MSE auxiliary loss.
+motion_loss_scale: 1.0
 
 lr: 4e-5
 agc: 0.3
@@ -70,6 +74,7 @@ dreamer_pro:
 
 rssm:
   recurrent: 'gru' # gru/sru
+  use_motion_sru: ${model.use_motion_sru}
   spatial_modulation: true
   stoch: 32
   deter: ${model.deter}
