@@ -113,11 +113,15 @@ class MultiEncoder(nn.Module):
         self.out_dim = 0
         self.selectors = []
         self.encoders = []
+        self.cnn_encoder_index = None
+        self.cnn_out_dim = 0
         if self.cnn_shapes:
             input_ch = sum([v[-1] for v in self.cnn_shapes.values()])
             input_shape = tuple(self.cnn_shapes.values())[0][:2] + (input_ch,)
+            self.cnn_encoder_index = len(self.encoders)
             self.encoders.append(ConvEncoder(config.cnn, input_shape))
             self.selectors.append(lambda obs: torch.cat([obs[k] for k in self.cnn_shapes], -1))
+            self.cnn_out_dim = self.encoders[-1].out_dim
             self.out_dim += self.encoders[-1].out_dim
         if self.mlp_shapes:
             inp_dim = sum([sum(v) for v in self.mlp_shapes.values()])
@@ -138,7 +142,21 @@ class MultiEncoder(nn.Module):
     def forward(self, obs):
         """Encode a dict of observations."""
         # dict of (B, T, *)
-        return self.fuser([enc(sel(obs)) for enc, sel in zip(self.encoders, self.selectors)])
+        embed, _ = self.forward_with_cnn(obs)
+        return embed
+
+    def forward_with_cnn(self, obs):
+        """Return the fused embedding and camera CNN output from one pass."""
+        parts = [
+            encoder(selector(obs))
+            for encoder, selector in zip(self.encoders, self.selectors)
+        ]
+        cnn = (
+            parts[self.cnn_encoder_index]
+            if self.cnn_encoder_index is not None
+            else None
+        )
+        return self.fuser(parts), cnn
 
 
 class MultiDecoder(nn.Module):

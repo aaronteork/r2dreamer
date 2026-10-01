@@ -21,6 +21,11 @@ fixed_continuation: ${oc.select:env.fixed_continuation,false}
 use_motion_sru: false
 # Multiplier for the raw 6-D ego-motion MSE auxiliary loss.
 motion_loss_scale: 1.0
+# Controlled extension: predict the next 1024-D camera CNN feature and combine
+# it with predicted ego-motion for spatial modulation. Disabled for all legacy
+# vanilla and Motion-SRU experiments/checkpoints.
+use_visual_spatial: false
+visual_loss_scale: 1.0
 
 lr: 4e-5
 agc: 0.3
@@ -75,6 +80,7 @@ dreamer_pro:
 rssm:
   recurrent: 'gru' # gru/sru
   use_motion_sru: ${model.use_motion_sru}
+  use_visual_spatial: ${model.use_visual_spatial}
   spatial_modulation: true
   stoch: 32
   deter: ${model.deter}

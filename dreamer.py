@@ -65,6 +65,21 @@ def _masked_motion_mse(prediction, target, is_first):
     return (squared_error * valid).sum() / valid.sum().clamp_min(1.0)
 
 
+def _masked_visual_mse(prediction, target, is_first):
+    """MSE for aligned CNN features, excluding synthetic reset rows."""
+    if prediction.shape != target.shape or prediction.shape[-1] != 1024:
+        raise ValueError(
+            "visual prediction and target must have identical (..., 1024) "
+            f"shapes, got {tuple(prediction.shape)} and {tuple(target.shape)}"
+        )
+    # The 1024-D reduction can overflow float16 for realistic BxT batches.
+    prediction = to_f32(prediction)
+    target = to_f32(target)
+    valid = _motion_valid_mask(prediction, is_first)
+    squared_error = (prediction - target).square()
+    return (squared_error * valid).sum() / valid.sum().clamp_min(1.0)
+
+
 class Dreamer(nn.Module):
     def __init__(self, config, obs_space, act_space):
         super().__init__()
@@ -83,17 +98,50 @@ class Dreamer(nn.Module):
         self.rep_loss = str(config.rep_loss)
         self.fixed_continuation = bool(getattr(config, "fixed_continuation", False))
         self.motion_loss_scale = float(getattr(config, "motion_loss_scale", 1.0))
+        self.use_motion_sru = bool(
+            getattr(
+                config.rssm,
+                "use_motion_sru",
+                getattr(config, "use_motion_sru", False),
+            )
+        )
+        self.use_visual_spatial = bool(
+            getattr(
+                config.rssm,
+                "use_visual_spatial",
+                getattr(config, "use_visual_spatial", False),
+            )
+        )
+        self.visual_loss_scale = float(
+            getattr(config, "visual_loss_scale", 1.0)
+        )
+        if self.use_visual_spatial and not self.use_motion_sru:
+            raise ValueError(
+                "use_visual_spatial=true requires use_motion_sru=true"
+            )
 
         # World model components
         shapes = {k: tuple(v.shape) for k, v in obs_space.spaces.items()}
         self.encoder = networks.MultiEncoder(config.encoder, shapes)
         self.embed_size = self.encoder.out_dim
+        if self.use_visual_spatial:
+            if tuple(self.encoder.cnn_shapes) != ("image",):
+                raise ValueError(
+                    "Motion+Visual-SRU requires exactly one CNN observation "
+                    "key named 'image'"
+                )
+            if self.encoder.cnn_out_dim != 1024:
+                raise ValueError(
+                    "Motion+Visual-SRU requires the 1024-D flattened camera "
+                    f"CNN output, got {self.encoder.cnn_out_dim}"
+                )
         proprio_dim = shapes.get("proprioception", (26,))[0] if "proprioception" in shapes else 26
         self.rssm = rssm.RSSM(
             config.rssm,
             self.embed_size,
             self.act_dim,
             proprio_dim=proprio_dim,
+            visual_dim=self.encoder.cnn_out_dim or 1024,
         )
         self.reward = networks.MLPHead(config.reward, self.rssm.feat_size)
         self.cont = networks.MLPHead(config.cont, self.rssm.feat_size)
@@ -199,6 +247,8 @@ class Dreamer(nn.Module):
                 modules["reconstruction_log_scales"] = self.reconstruction_log_scales
         if isinstance(self.rssm._deter_net, rssm.MotionSRUDeter):
             self._loss_scales["motion"] = self.motion_loss_scale
+            if self.rssm._deter_net.use_visual_spatial:
+                self._loss_scales["visual_prediction"] = self.visual_loss_scale
         # count number of parameters in each module
         for key, module in modules.items():
             if isinstance(module, nn.Parameter):
@@ -463,7 +513,13 @@ class Dreamer(nn.Module):
 
         # === World model: posterior rollout and KL losses ===
         # (B, T, E)
-        embed = self.encoder(data)
+        if self.use_visual_spatial:
+            # Reuse the current online camera encoding. The detached CNN-only
+            # tensor is a teacher target; it never enters the RSSM transition.
+            embed, visual_target = self.encoder.forward_with_cnn(data)
+        else:
+            embed = self.encoder(data)
+            visual_target = None
         # (B, T, S, K), (B, T, D), (B, T, S, K)
         post_stoch, post_deter, post_logit = self.rssm.observe(embed, data["action"], initial, data["is_first"])
         # (B, T, S, K)
@@ -496,6 +552,10 @@ class Dreamer(nn.Module):
             losses["motion"] = motion_loss
             metrics["motion_loss"] = motion_loss.detach()
             metrics["motion_loss_scaled"] = (
+                motion_loss.detach() * self.motion_loss_scale
+            )
+            metrics["motion_loss_raw"] = motion_loss.detach()
+            metrics["motion_loss_weighted"] = (
                 motion_loss.detach() * self.motion_loss_scale
             )
             motion_pred_detached = motion_pred.detach()
@@ -548,6 +608,49 @@ class Dreamer(nn.Module):
                 metrics["spatial_abs_dev_from_1"] = _masked_mean(
                     (spatial_terms - 1.0).abs(), spatial_valid
                 )
+        if self.use_visual_spatial:
+            visual_pred = self.rssm.last_visual_preds
+            if visual_pred is None or visual_target is None:
+                raise RuntimeError(
+                    "Motion+Visual-SRU did not produce aligned visual "
+                    "predictions and CNN targets"
+                )
+            # Stop-gradient is applied only to the teacher. visual_pred stays
+            # attached to both this loss and the recurrent spatial pathway.
+            visual_target = to_f32(visual_target.detach())
+            visual_loss = _masked_visual_mse(
+                visual_pred, visual_target, data["is_first"]
+            )
+            losses["visual_prediction"] = visual_loss
+            metrics["visual_prediction_loss_raw"] = visual_loss.detach()
+            metrics["visual_prediction_loss_weighted"] = (
+                visual_loss.detach() * self.visual_loss_scale
+            )
+
+            visual_pred_detached = to_f32(visual_pred.detach())
+            valid = _motion_valid_mask(
+                visual_pred_detached, data["is_first"]
+            )
+            pred_mean = _masked_mean(visual_pred_detached, valid)
+            target_mean = _masked_mean(visual_target, valid)
+            metrics["visual_pred_mean"] = pred_mean
+            metrics["visual_pred_std"] = torch.sqrt(
+                _masked_mean(
+                    (visual_pred_detached - pred_mean).square(), valid
+                )
+            )
+            metrics["visual_target_mean"] = target_mean
+            metrics["visual_target_std"] = torch.sqrt(
+                _masked_mean((visual_target - target_mean).square(), valid)
+            )
+            metrics["visual_prediction_mse"] = visual_loss.detach()
+            cosine = F.cosine_similarity(
+                visual_pred_detached, visual_target, dim=-1
+            ).unsqueeze(-1)
+            cosine_valid = _motion_valid_mask(cosine, data["is_first"])
+            metrics["visual_prediction_cosine_similarity"] = _masked_mean(
+                cosine, cosine_valid
+            )
         # === Representation / auxiliary losses ===
         # (B, T, F)
         feat = self.rssm.get_feat(post_stoch, post_deter)
