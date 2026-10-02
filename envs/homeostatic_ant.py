@@ -92,15 +92,14 @@ class HomeostaticAntR2Env(gym.Env):
         The return value intentionally remains the observation-only format used
         by R2Dreamer's training loop.
         """
-        del options
         if seed is not None:
-            obs, _ = self._env.reset(seed=seed)
+            obs, _ = self._env.reset(seed=seed, options=options)
             self._needs_seed = False
         elif self._needs_seed:
-            obs, _ = self._env.reset(seed=self._seed)
+            obs, _ = self._env.reset(seed=self._seed, options=options)
             self._needs_seed = False
         else:
-            obs, _ = self._env.reset()
+            obs, _ = self._env.reset(options=options)
 
         return self._convert(
             obs, is_first=True, is_last=False, is_terminal=False

@@ -43,6 +43,7 @@ class HomeostaticAntEnv(AntEnv, EzPickle):
 
         # -------------- Setup config -------------- #
         self.cfg = cfg
+        self._reset_options: dict[str, object] = {}
 
         # ----------------- Environment Setup ----------------- #
         # Create environment
@@ -92,6 +93,13 @@ class HomeostaticAntEnv(AntEnv, EzPickle):
         self._ego_motion = np.zeros(6, dtype=np.float32)
         self._previous_torso_position = None
         self._previous_torso_rotation = None
+        self.resources_consumed: list[str] = []
+        self._initial_hunger = 0.0
+        self._initial_thirst = 0.0
+        self._initial_food_side = ""
+        self._initial_water_side = ""
+        self._initial_food_position = np.full(2, np.nan, dtype=np.float64)
+        self._initial_water_position = np.full(2, np.nan, dtype=np.float64)
 
         # Track resources and agent
         self.object= []
@@ -154,6 +162,14 @@ class HomeostaticAntEnv(AntEnv, EzPickle):
 
         EzPickle.__init__(**locals())
 
+    def reset(self, *, seed=None, options=None):
+        """Reset with optional controlled evaluation conditions."""
+        self._reset_options = dict(options or {})
+        try:
+            return super().reset(seed=seed, options=options)
+        finally:
+            self._reset_options = {}
+
     def reset_model(self):
         # Reset initial states
         if self.cfg.is_training:
@@ -162,16 +178,24 @@ class HomeostaticAntEnv(AntEnv, EzPickle):
             self.thirst = self.np_random.uniform(-(self.cfg.training_initial_bounds), (self.cfg.training_initial_bounds))
             self.temperature = self.np_random.uniform(-(self.cfg.training_initial_bounds), (self.cfg.training_initial_bounds))
         else:
-            # For shifting internal state task
-            if self.cfg.shift:
-                if self.np_random.random() < 0.5:
-                    self.hunger = self.np_random.uniform(-0.15, -0.11)
-                    self.thirst = self.np_random.uniform(-0.1, -0.05)
-                    self.temperature = 0.0  # placeholder value
+            # For imagine task
+            if self.cfg.imagine:
+                dominant_need = self._reset_options.get("dominant_need")
+                if dominant_need is None:
+                    dominant_need = (
+                        "hunger" if self.np_random.random() < 0.5 else "thirst"
+                    )
+                if dominant_need not in {"hunger", "thirst"}:
+                    raise ValueError(
+                        "imagination dominant_need must be 'hunger' or 'thirst'"
+                    )
+                primary = self.np_random.uniform(-0.5, -0.4)
+                secondary = self.np_random.uniform(-0.3, -0.2)
+                if dominant_need == "hunger":
+                    self.hunger, self.thirst = primary, secondary
                 else:
-                    self.hunger = self.np_random.uniform(-0.1, -0.05)
-                    self.thirst = self.np_random.uniform(-0.15, -0.11)
-                    self.temperature = 0.0  # placeholder value
+                    self.hunger, self.thirst = secondary, primary
+                self.temperature = 0.0
             else:
                 self.hunger = 0.0
                 self.thirst = 0.0
@@ -186,14 +210,23 @@ class HomeostaticAntEnv(AntEnv, EzPickle):
         self.food_consumed = 0
         self.water_consumed = 0
         self.heat_exposed_time = 0.0
+        self.resources_consumed = []
+        self._initial_hunger = self.hunger
+        self._initial_thirst = self.thirst
+        self._initial_food_side = ""
+        self._initial_water_side = ""
+        self._initial_food_position.fill(np.nan)
+        self._initial_water_position.fill(np.nan)
 
         # --------------- Agent's initial position and orientation ---------------
         # Ranomize agent's initial position and orientation, but keep it within the arena and not too close to the walls
         # self.init_qpos includes the x and y coordinates in the first 2 entries, different from observation space which does not
-        if self.cfg.shift:
-            qpos = self.init_qpos
+        if self.cfg.imagine:
+            qpos = self.init_qpos.copy()
             qpos[1] = -3.0
-            qvel = self.init_qvel
+            yaw = np.deg2rad(90)
+            qpos[3:7] = [np.cos(yaw / 2), 0.0, 0.0, np.sin(yaw / 2)]
+            qvel = self.init_qvel.copy()
         else:
             qpos = self.init_qpos + self.np_random.uniform(
                 size=self.model.nq, low=-0.01, high=0.01
@@ -220,11 +253,24 @@ class HomeostaticAntEnv(AntEnv, EzPickle):
         # ------------------- Reset resources ------------------- #
         self.object = []
         existing_items = set()            
-        if self.cfg.shift:
-            # Add one food
-            self.object.append(("food", -3, 4))
-            # Add one water
-            self.object.append(("water", 3, 4))
+        if self.cfg.imagine:
+            left = (-3.0, 4.0)
+            right = (3.0, 4.0)
+            food_side = self._reset_options.get("food_side")
+            if food_side is None:
+                food_side = "left" if self.np_random.random() < 0.5 else "right"
+            if food_side not in {"left", "right"}:
+                raise ValueError("imagination food_side must be 'left' or 'right'")
+            if food_side == "left":
+                food, water = left, right
+                self.object = [("food", *left), ("water", *right)]
+            else:
+                food, water = right, left
+                self.object = [("water", *left), ("food", *right)]
+            self._initial_food_side = food_side
+            self._initial_water_side = "right" if food_side == "left" else "left"
+            self._initial_food_position = np.asarray(food, dtype=np.float64)
+            self._initial_water_position = np.asarray(water, dtype=np.float64)
         else:
             # Food with random positions
             for i in range(self.cfg.num_food):
@@ -521,20 +567,6 @@ class HomeostaticAntEnv(AntEnv, EzPickle):
         self.current_step += 1
         self.posture = self._get_posture()
 
-        # Add shift after 50 steps
-        # Change the secondary resource positions after 50 steps if shift is enabled
-        if self.cfg.shift and self.current_step == 100:
-            if self.hunger < self.thirst:
-                self.thirst -= 0.2
-            elif self.hunger > self.thirst:
-                self.hunger -= 0.2
-            else:
-                # Randomly choose one to decrease if they are equal
-                if self.np_random.random() < 0.5:
-                    self.hunger -= 0.2
-                else:
-                    self.thirst -= 0.2
-
         # Homeostatic Dynamics
         is_night = (self.current_step % self.cfg.day_night_cycle_len) >= (
             self.cfg.day_night_cycle_len / 2
@@ -549,16 +581,26 @@ class HomeostaticAntEnv(AntEnv, EzPickle):
             type_gen, x, y = obj
             if np.linalg.norm(ant_pos - np.array([x, y])) < self.cfg.object_interaction_dist:
                 if type_gen == "food" and self._is_in_camera_fov(np.array([x, y])):
-                    self.hunger += self.cfg.replenish_rate
+                    if self.cfg.imagine:
+                        self.hunger = 0.0
+                    else:
+                        self.hunger += self.cfg.replenish_rate
                     self.food_consumed += 1
+                    if self.cfg.imagine:
+                        self.resources_consumed.append("food")
                     self.object.remove(obj)
-                    if not self.cfg.shift:
+                    if not self.cfg.imagine:
                         self.object.append(self._generate_new_object(type_gen))
                 elif type_gen == "water" and self._is_in_camera_fov(np.array([x, y])):
-                    self.thirst += self.cfg.replenish_rate
+                    if self.cfg.imagine:
+                        self.thirst = 0.0
+                    else:
+                        self.thirst += self.cfg.replenish_rate
                     self.water_consumed += 1
+                    if self.cfg.imagine:
+                        self.resources_consumed.append("water")
                     self.object.remove(obj)
-                    if not self.cfg.shift:
+                    if not self.cfg.imagine:
                         self.object.append(self._generate_new_object(type_gen))
                 elif type_gen == "heat":
                     # heat doesnt get consumed
@@ -648,6 +690,20 @@ class HomeostaticAntEnv(AntEnv, EzPickle):
             "reward_posture_penalty": np.array(posture_penalty),
             "ego_motion": self._ego_motion.copy(),
         }
+        if self.cfg.imagine:
+            info.update(
+                {
+                    "resources_consumed": list(self.resources_consumed),
+                    "initial_hunger": np.array(self._initial_hunger),
+                    "initial_thirst": np.array(self._initial_thirst),
+                    "initial_food_side": self._initial_food_side,
+                    "initial_water_side": self._initial_water_side,
+                    "initial_food_x": np.array(self._initial_food_position[0]),
+                    "initial_food_y": np.array(self._initial_food_position[1]),
+                    "initial_water_x": np.array(self._initial_water_position[0]),
+                    "initial_water_y": np.array(self._initial_water_position[1]),
+                }
+            )
 
         # info = {
         #     "time": {"timestep": self.current_step, "is_night": is_night},

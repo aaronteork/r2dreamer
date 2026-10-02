@@ -11,15 +11,13 @@ Evaluate the normal foraging task from a completed run::
 
     python eval.py --task forage --run-dir logdir/homeostatic-ant
 
-Evaluate the internal-state shift task without recording video::
+Evaluate notebook-style imagination from the run's latest checkpoint::
 
-    python eval.py --task shift \
+    python eval.py --task imagine \
         --run-dir logdir/homeostatic-ant \
+        --episodes 100 \
+        --seed 100000 \
         --no-video
-
-Evaluate selective and sequential resource collection in the Y-maze::
-
-    python eval.py --task ymaze --run-dir logdir/homeostatic-ant
 
 Evaluate zero-shot landmark recall in the partitioned open field::
 
@@ -44,9 +42,7 @@ from tensordict import TensorDict
 from custom_env.ant_env import HomeostaticAntEnv
 from custom_env.config_env import EnvConfig
 from custom_env.config_partition import PartitionConfig
-from custom_env.config_ymaze import YMazeConfig
 from custom_env.partition_env import PartitionRecallEnv
-from custom_env.ymaze_env import YMazeTestEnv
 from dreamer import Dreamer
 from envs.homeostatic_ant import HomeostaticAntR2Env
 from tools import set_seed_everywhere
@@ -61,22 +57,15 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Evaluate an R2Dreamer agent.")
     parser.add_argument(
         "--task",
-        choices=("forage", "shift", "ymaze", "partition"),
+        choices=("forage", "imagine", "partition"),
         required=True,
         help="Evaluation task.",
     )
-    checkpoint = parser.add_mutually_exclusive_group(required=True)
-    checkpoint.add_argument(
+    parser.add_argument(
         "--run-dir",
         type=Path,
+        required=True,
         help="Training-run directory containing latest.pt and .hydra/config.yaml.",
-    )
-    checkpoint.add_argument(
-        "--model-path",
-        "--model_path",
-        dest="model_path",
-        type=Path,
-        help="Specific R2Dreamer checkpoint (legacy interface).",
     )
     parser.add_argument(
         "--config",
@@ -88,7 +77,7 @@ def parse_args() -> argparse.Namespace:
         "--episodes",
         type=int,
         default=None,
-        help="Number of episodes (default: 1 for forage, 10 otherwise).",
+        help="Number of episodes (default: 1 forage, 100 imagine, 100 partition).",
     )
     parser.add_argument(
         "--max-steps",
@@ -126,14 +115,23 @@ def parse_args() -> argparse.Namespace:
         default=512,
         help="Width and height of each square output video.",
     )
+    parser.add_argument(
+        "--imagination-anchor-delay",
+        type=int,
+        default=10,
+        help="Real steps after first consumption before anchoring imagination.",
+    )
+    parser.add_argument(
+        "--imagination-horizon",
+        type=int,
+        default=50,
+        help="Number of future steps in each imagination rollout.",
+    )
     args = parser.parse_args()
 
-    if args.run_dir is not None:
-        if not args.run_dir.is_dir():
-            parser.error(f"Run directory not found: {args.run_dir}")
-        args.model_path = args.run_dir / "latest.pt"
-    else:
-        args.run_dir = args.model_path.parent
+    if not args.run_dir.is_dir():
+        parser.error(f"Run directory not found: {args.run_dir}")
+    args.model_path = args.run_dir / "latest.pt"
     if not args.model_path.is_file():
         parser.error(f"Checkpoint not found: {args.model_path}")
     if args.config is not None and not args.config.is_file():
@@ -146,6 +144,10 @@ def parse_args() -> argparse.Namespace:
         parser.error("--video-fps must be positive.")
     if args.video_size < 1:
         parser.error("--video-size must be at least 1.")
+    if args.imagination_anchor_delay < 0:
+        parser.error("--imagination-anchor-delay cannot be negative.")
+    if args.imagination_horizon < 1:
+        parser.error("--imagination-horizon must be at least 1.")
     return args
 
 
@@ -208,37 +210,9 @@ def make_env_config(
         device=torch.device(config.model.device),
         is_training=False,
         image_size=render_size or tuple(map(int, config.env.size)),
-        shift=task == "shift",
+        imagine=task == "imagine",
     )
     return EnvConfig(**configured)
-
-
-def make_ymaze_env(
-    config: Any,
-    *,
-    seed: int,
-    render_size: tuple[int, int] | None = None,
-) -> Any:
-    """Build the local held-out Y-maze with the training observation contract."""
-    policy_size = tuple(map(int, config.env.size))
-    valid_fields = {field.name for field in fields(YMazeConfig)}
-    configured = {
-        key: value for key, value in dict(config.env).items()
-        if key in valid_fields
-    }
-    configured.update(
-        seed=seed,
-        device=torch.device(config.model.device),
-        image_size=render_size or policy_size,
-        is_training=False,
-        num_heat=0,
-        obs_space_dim=26,
-        shift=False,
-    )
-    ymaze_config = YMazeConfig(**configured)
-    return R2DreamerEnvAdapter(
-        YMazeTestEnv(ymaze_config), seed=seed, policy_size=policy_size
-    )
 
 
 def make_partition_env(
@@ -265,7 +239,7 @@ def make_partition_env(
         num_heat=0,
         obs_space_dim=26,
         max_steps=10_000,
-        shift=False,
+        imagine=False,
     )
     partition_config = PartitionConfig(**configured)
     return R2DreamerEnvAdapter(
@@ -320,8 +294,12 @@ class R2DreamerEnvAdapter:
             "is_terminal": np.array(last, dtype=np.bool_),
         }
 
-    def reset(self, *, seed: int | None = None) -> dict[str, np.ndarray]:
-        result = self._env.reset(seed=self._seed if seed is None else seed)
+    def reset(
+        self, *, seed: int | None = None, options: dict[str, Any] | None = None
+    ) -> dict[str, np.ndarray]:
+        result = self._env.reset(
+            seed=self._seed if seed is None else seed, options=options
+        )
         observation = result[0] if isinstance(result, tuple) else result
         return self._convert(observation, first=True, last=False)
 
@@ -468,6 +446,17 @@ def episode_summary(
         row["initial_hunger"] = scalar(info, "initial_hunger")
     if "initial_thirst" in info:
         row["initial_thirst"] = scalar(info, "initial_thirst")
+    for key in ("initial_food_side", "initial_water_side"):
+        if key in info:
+            row[key] = str(info[key])
+    for key in (
+        "initial_food_x",
+        "initial_food_y",
+        "initial_water_x",
+        "initial_water_y",
+    ):
+        if key in info:
+            row[key] = scalar(info, key)
     if "resources_consumed" in info:
         resources = [str(resource) for resource in info["resources_consumed"]]
         row["resource_sequence"] = ">".join(resources)
@@ -534,7 +523,7 @@ def evaluation_summary(
                     for row in rows
                 ]
             )
-        ) if task == "partition" else float(
+        ) if task in {"partition", "imagine"} else float(
             np.mean([row["outcome"] == "resources_collected" for row in rows])
         ),
         "survival_to_cutoff_rate": float(
@@ -551,6 +540,19 @@ def evaluation_summary(
         result["correct_sequence_success_rate"] = float(
             np.mean([row.get("correct_resource_sequence", 0) for row in rows])
         )
+    if any("dominant_need" in row for row in rows):
+        result["hunger_dominant_episodes"] = sum(
+            row.get("dominant_need") == "hunger" for row in rows
+        )
+        result["thirst_dominant_episodes"] = sum(
+            row.get("dominant_need") == "thirst" for row in rows
+        )
+        result["food_left_episodes"] = sum(
+            row.get("food_side") == "left" for row in rows
+        )
+        result["food_right_episodes"] = sum(
+            row.get("food_side") == "right" for row in rows
+        )
     if task == "partition":
         return {
             key: result[key]
@@ -561,9 +563,382 @@ def evaluation_summary(
                 "first_resource_accuracy",
                 "second_resource_collection_rate",
                 "correct_sequence_success_rate",
+                "hunger_dominant_episodes",
+                "thirst_dominant_episodes",
+                "food_left_episodes",
+                "food_right_episodes",
             )
         }
+    if task == "imagine":
+        predicted = [row for row in rows if "mean_actual_action_ssim" in row]
+        result["imagination_completion_rate"] = float(
+            np.mean([row.get("full_imagination_horizon", 0) for row in rows])
+        )
+        result["mean_actual_action_ssim"] = (
+            float(
+                np.mean([row["mean_actual_action_ssim"] for row in predicted])
+            )
+            if predicted
+            else float("nan")
+        )
+        result["mean_imagined_action_ssim"] = (
+            float(
+                np.mean([row["mean_imagined_action_ssim"] for row in predicted])
+            )
+            if predicted
+            else float("nan")
+        )
     return result
+
+
+def balanced_resource_conditions(
+    episodes: int, seed: int
+) -> list[dict[str, str]]:
+    """Create a reproducible, near-factorially-balanced condition schedule."""
+    combinations = [
+        {"dominant_need": need, "food_side": side}
+        for need in ("hunger", "thirst")
+        for side in ("left", "right")
+    ]
+    conditions = [dict(item) for item in combinations for _ in range(episodes // 4)]
+    remainder = episodes % 4
+    rng = np.random.default_rng(seed)
+    if remainder == 1:
+        conditions.append(dict(combinations[int(rng.integers(4))]))
+    elif remainder == 2:
+        diagonals = ((0, 3), (1, 2))
+        for index in diagonals[int(rng.integers(2))]:
+            conditions.append(dict(combinations[index]))
+    elif remainder == 3:
+        omitted = int(rng.integers(4))
+        conditions.extend(
+            dict(item) for index, item in enumerate(combinations) if index != omitted
+        )
+    rng.shuffle(conditions)
+    return conditions
+
+
+def set_torch_seed(seed: int) -> None:
+    """Reset latent sampling without changing an environment's private RNG."""
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def save_rollout_grid(
+    path: Path,
+    rollouts: list[tuple[str, list[np.ndarray]]],
+    *,
+    sample_interval: int = 5,
+) -> None:
+    """Save labelled rollout rows using the anchor and every Nth future frame."""
+    try:
+        import cv2
+    except ImportError as error:
+        raise RuntimeError(
+            "Saving imagination PNGs requires opencv-python."
+        ) from error
+    if sample_interval < 1:
+        raise ValueError("sample_interval must be positive")
+    if not rollouts or any(not frames for _, frames in rollouts):
+        raise ValueError("Each rollout row must contain at least one frame")
+
+    labelled_rows: list[tuple[str, list[np.ndarray]]] = []
+    for label, frames in rollouts:
+        indices = [0, *range(sample_interval, len(frames), sample_interval)]
+        images = []
+        for index in indices:
+            image = np.asarray(frames[index])[..., :3]
+            if np.issubdtype(image.dtype, np.floating):
+                image = np.clip(image, 0.0, 1.0) * 255.0
+            images.append(np.asarray(image, dtype=np.uint8))
+        labelled_rows.append((label, images))
+
+    frame_height, frame_width = labelled_rows[0][1][0].shape[:2]
+    column_count = max(len(images) for _, images in labelled_rows)
+    label_width = max(128, frame_width * 2)
+    canvas = np.full(
+        (frame_height * len(labelled_rows), label_width + frame_width * column_count, 3),
+        255,
+        dtype=np.uint8,
+    )
+    for row_index, (label, images) in enumerate(labelled_rows):
+        y_start = row_index * frame_height
+        for column_index, image in enumerate(images):
+            if image.shape[:2] != (frame_height, frame_width):
+                raise ValueError("All rollout images must have identical dimensions")
+            x_start = label_width + column_index * frame_width
+            canvas[
+                y_start : y_start + frame_height,
+                x_start : x_start + frame_width,
+            ] = image
+        cv2.putText(
+            canvas,
+            label,
+            (8, y_start + frame_height // 2 + 5),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.42,
+            (0, 0, 0),
+            1,
+            cv2.LINE_AA,
+        )
+        if row_index:
+            cv2.line(
+                canvas,
+                (0, y_start),
+                (canvas.shape[1] - 1, y_start),
+                (192, 192, 192),
+                1,
+            )
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not cv2.imwrite(str(path), cv2.cvtColor(canvas, cv2.COLOR_RGB2BGR)):
+        raise RuntimeError(f"Failed to save imagination image: {path}")
+
+
+def rgb_ssim(actual: np.ndarray, predicted: np.ndarray) -> float:
+    """Return RGB structural similarity for images represented on [0, 1]."""
+    try:
+        from skimage.metrics import structural_similarity
+    except ImportError as error:
+        raise RuntimeError(
+            "Computing imagination SSIM requires scikit-image."
+        ) from error
+    return float(
+        structural_similarity(
+            np.clip(actual[..., :3], 0.0, 1.0),
+            np.clip(predicted[..., :3], 0.0, 1.0),
+            channel_axis=-1,
+            data_range=1.0,
+        )
+    )
+
+
+@torch.inference_mode()
+def evaluate_imagination(
+    agent: Dreamer,
+    env: Any,
+    *,
+    episodes: int,
+    max_steps: int,
+    first_seed: int,
+    stochastic: bool,
+    anchor_delay: int,
+    horizon: int,
+    image_dir: Path,
+    recorder: VideoRecorder | None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    """Run the notebook protocol and save one labelled rollout grid per episode."""
+    if not hasattr(agent, "decoder"):
+        raise ValueError(
+            "Imagination images require a checkpoint trained with rep_loss='dreamer'; "
+            "this checkpoint has no observation decoder."
+        )
+
+    step_rows: list[dict[str, Any]] = []
+    episode_rows: list[dict[str, Any]] = []
+    prediction_rows: list[dict[str, Any]] = []
+    conditions = balanced_resource_conditions(episodes, first_seed)
+
+    for episode, condition in enumerate(conditions):
+        environment_seed = first_seed + episode
+        latent_seed = first_seed + 1_000_000_000 + episode
+        observation = env.reset(seed=environment_seed, options=condition)
+        set_torch_seed(latent_seed)
+        state = agent.get_initial_state(1)
+        precollection_frames = [observation["image"].copy()]
+        total_reward = 0.0
+        info: dict[str, Any] = {}
+        outcome = "evaluation_cutoff"
+        first_consumption_step: int | None = None
+        steps_after_consumption: int | None = None
+        anchor_step: int | None = None
+        anchor: tuple[torch.Tensor, torch.Tensor] | None = None
+        anchor_image: np.ndarray | None = None
+        future_actions: list[torch.Tensor] = []
+        actual_images: list[np.ndarray] = []
+        previous_consumed = 0
+
+        for step in range(1, max_steps + 1):
+            action, state = agent.act(
+                observation_batch(observation, agent.device),
+                state,
+                eval=not stochastic,
+            )
+            if steps_after_consumption == anchor_delay and anchor is None:
+                anchor = (state["stoch"].clone(), state["deter"].clone())
+                anchor_image = observation["image"].copy()
+                anchor_step = step - 1
+
+            next_observation, reward, done, info = env.step(
+                action.squeeze(0).detach().cpu().numpy()
+            )
+            if anchor is not None:
+                future_actions.append(action.detach().clone())
+                actual_images.append(next_observation["image"].copy())
+
+            reward_value = float(reward)
+            total_reward += reward_value
+            if recorder is not None:
+                recorder.write(info)
+            consumed = int(
+                scalar(info, "food_consumed") + scalar(info, "water_consumed")
+            )
+            if consumed == 0 and step % 10 == 0:
+                precollection_frames.append(next_observation["image"].copy())
+            step_rows.append(
+                {
+                    "episode": episode + 1,
+                    "environment_seed": environment_seed,
+                    "latent_seed": latent_seed,
+                    "dominant_need": condition["dominant_need"],
+                    "food_side": condition["food_side"],
+                    "step": step,
+                    "reward": reward_value,
+                    "food_consumed": int(scalar(info, "food_consumed")),
+                    "water_consumed": int(scalar(info, "water_consumed")),
+                    "hunger": scalar(info, "hunger"),
+                    "thirst": scalar(info, "thirst"),
+                }
+            )
+
+            if previous_consumed == 0 and consumed >= 1:
+                first_consumption_step = step
+                steps_after_consumption = 0
+            elif steps_after_consumption is not None and anchor is None:
+                steps_after_consumption += 1
+            previous_consumed = consumed
+            observation = next_observation
+
+            if len(future_actions) >= horizon:
+                outcome = "imagination_complete"
+                break
+            if consumed >= 2:
+                outcome = "resources_collected"
+                break
+            if done:
+                outcome = (
+                    "environment_truncation"
+                    if bool(info.get("evaluation_truncated", False))
+                    else "homeostatic_termination"
+                )
+                break
+
+        row = episode_summary(
+            episode + 1,
+            environment_seed,
+            step,
+            total_reward,
+            outcome,
+            info,
+        )
+        row.update(
+            {
+                "environment_seed": environment_seed,
+                "latent_seed": latent_seed,
+                "dominant_need": condition["dominant_need"],
+                "food_side": condition["food_side"],
+                "first_consumption_step": first_consumption_step,
+                "imagination_anchor_step": anchor_step,
+                "imagination_steps": len(future_actions),
+                "full_imagination_horizon": int(len(future_actions) == horizon),
+            }
+        )
+
+        if anchor is not None and future_actions and anchor_image is not None:
+            actions = torch.stack(future_actions, dim=1)
+            set_torch_seed(latent_seed + 10_000_000)
+            actual_stoch, actual_deter = agent._frozen_rssm.imagine_with_action(
+                *anchor, actions
+            )
+            actual_action_prediction = (
+                agent.decoder(actual_stoch, actual_deter)["image"]
+                .mode()[0]
+                .cpu()
+                .numpy()
+            )
+
+            set_torch_seed(latent_seed + 20_000_000)
+            stoch, deter = (value.clone() for value in anchor)
+            imagined_stoch, imagined_deter = [], []
+            for _ in range(len(future_actions)):
+                feat = agent._frozen_rssm.get_feat(stoch, deter)
+                imagined_action = agent._frozen_actor(feat).rsample()
+                stoch, deter = agent._frozen_rssm.img_step(
+                    stoch, deter, imagined_action
+                )
+                imagined_stoch.append(stoch)
+                imagined_deter.append(deter)
+            imagined_prediction = (
+                agent.decoder(
+                    torch.stack(imagined_stoch, dim=1),
+                    torch.stack(imagined_deter, dim=1),
+                )["image"]
+                .mode()[0]
+                .cpu()
+                .numpy()
+            )
+
+            actual = np.stack(actual_images).astype(np.float32) / 255.0
+            episode_predictions: list[dict[str, Any]] = []
+            for index, (truth, actual_action_frame, imagined_action_frame) in enumerate(
+                zip(
+                    actual,
+                    actual_action_prediction,
+                    imagined_prediction,
+                ),
+                start=1,
+            ):
+                prediction_row = {
+                    "episode": episode + 1,
+                    "environment_seed": environment_seed,
+                    "latent_seed": latent_seed,
+                    "horizon_step": index,
+                    "actual_action_ssim": rgb_ssim(
+                        truth, actual_action_frame
+                    ),
+                    "imagined_action_ssim": rgb_ssim(
+                        truth, imagined_action_frame
+                    ),
+                }
+                episode_predictions.append(prediction_row)
+                prediction_rows.append(prediction_row)
+            row["mean_actual_action_ssim"] = float(
+                np.mean(
+                    [item["actual_action_ssim"] for item in episode_predictions]
+                )
+            )
+            row["mean_imagined_action_ssim"] = float(
+                np.mean(
+                    [item["imagined_action_ssim"] for item in episode_predictions]
+                )
+            )
+            save_rollout_grid(
+                image_dir / f"ep{episode + 1}.png",
+                [
+                    ("actual", [anchor_image, *actual_images]),
+                    ("imagine", [anchor_image, *list(imagined_prediction)]),
+                    (
+                        "actualimagine",
+                        [anchor_image, *list(actual_action_prediction)],
+                    ),
+                ],
+            )
+
+        save_rollout_grid(
+            image_dir / f"ep{episode + 1}_precollection.png",
+            [("precollection", precollection_frames)],
+            sample_interval=1,
+        )
+
+        episode_rows.append(row)
+        print(
+            f"Episode {episode + 1}/{episodes}: {outcome} after {step} steps; "
+            f"imagination={len(future_actions)}/{horizon}",
+            flush=True,
+        )
+
+    return step_rows, episode_rows, prediction_rows
 
 
 @torch.inference_mode()
@@ -581,9 +956,17 @@ def evaluate(
     step_rows: list[dict[str, Any]] = []
     episode_rows: list[dict[str, Any]] = []
 
-    for episode in range(episodes):
+    conditions: list[dict[str, str] | None]
+    if task == "partition":
+        conditions = balanced_resource_conditions(episodes, first_seed)
+    else:
+        conditions = [None] * episodes
+
+    for episode, condition in enumerate(conditions):
         seed = first_seed + episode
-        observation = env.reset(seed=seed)
+        latent_seed = first_seed + 1_000_000_000 + episode
+        observation = env.reset(seed=seed, options=condition)
+        set_torch_seed(latent_seed)
         state = agent.get_initial_state(1)
         total_reward = 0.0
         info: dict[str, Any] = {}
@@ -606,6 +989,7 @@ def evaluate(
             step_row = {
                 "episode": episode,
                 "seed": seed,
+                "latent_seed": latent_seed,
                 "step": step,
                 "reward": reward_value,
                 "food_consumed": int(scalar(info, "food_consumed")),
@@ -638,11 +1022,11 @@ def evaluate(
             step_rows.append(step_row)
 
             resources_collected = (
-                task in {"shift", "ymaze", "partition"}
+                task in {"imagine", "partition"}
                 and scalar(info, "food_consumed") >= 1
                 and scalar(info, "water_consumed") >= 1
             )
-            if resources_collected and (task in {"ymaze", "partition"} or not done):
+            if resources_collected and (task == "partition" or not done):
                 if task == "partition":
                     resources = [
                         str(resource)
@@ -680,11 +1064,13 @@ def evaluate(
             #         flush=True,
             #     )
 
-        episode_rows.append(
-            episode_summary(
-                episode, seed, step, total_reward, outcome, info
-            )
+        episode_row = episode_summary(
+            episode, seed, step, total_reward, outcome, info
         )
+        episode_row["latent_seed"] = latent_seed
+        if condition is not None:
+            episode_row.update(condition)
+        episode_rows.append(episode_row)
         print(
             f"Episode {episode + 1}/{episodes}: {outcome} after {step} steps; "
             f"food={int(scalar(info, 'food_consumed'))}, "
@@ -692,6 +1078,32 @@ def evaluate(
         )
 
     return step_rows, episode_rows
+
+
+def make_task_env(
+    args: argparse.Namespace,
+    config: Any,
+    render_size: tuple[int, int] | None,
+) -> tuple[Any, int]:
+    if args.task == "partition":
+        env = make_partition_env(config, seed=args.seed, render_size=render_size)
+        return env, int(env._env.cfg.max_steps)
+
+    env_config = make_env_config(
+        config,
+        task=args.task,
+        seed=args.seed,
+        render_size=render_size,
+    )
+    if render_size is None:
+        env = HomeostaticAntR2Env(env_config, seed=args.seed)
+    else:
+        env = R2DreamerEnvAdapter(
+            HomeostaticAntEnv(env_config),
+            seed=args.seed,
+            policy_size=tuple(map(int, config.env.size)),
+        )
+    return env, int(env_config.eval_max_steps)
 
 
 def main() -> None:
@@ -705,78 +1117,78 @@ def main() -> None:
             f"This evaluator supports homeoant_ant runs, not {config.env.task!r}."
         )
 
-    episodes = args.episodes or (1 if args.task == "forage" else 10)
+    default_episodes = {"forage": 1, "imagine": 100, "partition": 100}
+    episodes = args.episodes or default_episodes[args.task]
     render_size = None if args.no_video else (args.video_size, args.video_size)
-    if args.task == "ymaze":
-        env = make_ymaze_env(
-            config, seed=args.seed, render_size=render_size
-        )
-        default_max_steps = int(env._env.cfg.max_steps)
-    elif args.task == "partition":
-        env = make_partition_env(
-            config, seed=args.seed, render_size=render_size
-        )
-        default_max_steps = int(env._env.cfg.max_steps)
-    else:
-        env_config = make_env_config(
-            config,
-            task=args.task,
-            seed=args.seed,
-            render_size=render_size,
-        )
-        if render_size is None:
-            env = HomeostaticAntR2Env(env_config, seed=args.seed)
-        else:
-            # Render the environment at the requested video resolution, then
-            # downsample only the policy observation to its training size.
-            env = R2DreamerEnvAdapter(
-                HomeostaticAntEnv(env_config),
-                seed=args.seed,
-                policy_size=tuple(map(int, config.env.size)),
-            )
-        default_max_steps = int(env_config.eval_max_steps)
-    max_steps = args.max_steps or default_max_steps
-    set_seed_everywhere(args.seed)
-
+    run_dir = config_path.parent.parent
     output_dir = (
         args.output_dir.resolve()
         if args.output_dir is not None
-        else args.run_dir.resolve() / "evaluation" / DATETIME
+        else run_dir / "evaluation" / DATETIME
     )
     output_dir.mkdir(parents=True, exist_ok=True)
+    env, default_max_steps = make_task_env(args, config, render_size)
+    max_steps = args.max_steps or default_max_steps
+    set_seed_everywhere(args.seed)
     recorder = None
+    prediction_rows: list[dict[str, Any]] = []
     try:
+        print(f"Evaluating checkpoint: {model_path.name}", flush=True)
         agent = load_agent(model_path, config, env, device)
         if not args.no_video:
             recorder = VideoRecorder(
-                output_dir, args.task, args.video_fps, args.video_size
+                output_dir,
+                args.task,
+                args.video_fps,
+                args.video_size,
             )
-        step_rows, episode_rows = evaluate(
-            agent,
-            env,
-            task=args.task,
-            episodes=episodes,
-            max_steps=max_steps,
-            first_seed=args.seed,
-            stochastic=args.stochastic,
-            recorder=recorder,
-        )
+        if args.task == "imagine":
+            step_rows, episode_rows, prediction_rows = evaluate_imagination(
+                agent,
+                env,
+                episodes=episodes,
+                max_steps=max_steps,
+                first_seed=args.seed,
+                stochastic=args.stochastic,
+                anchor_delay=args.imagination_anchor_delay,
+                horizon=args.imagination_horizon,
+                image_dir=output_dir / "imagination",
+                recorder=recorder,
+            )
+        else:
+            step_rows, episode_rows = evaluate(
+                agent,
+                env,
+                task=args.task,
+                episodes=episodes,
+                max_steps=max_steps,
+                first_seed=args.seed,
+                stochastic=args.stochastic,
+                recorder=recorder,
+            )
     finally:
         if recorder is not None:
             recorder.close()
         env.close()
 
+    for rows in (step_rows, episode_rows, prediction_rows):
+        for row in rows:
+            row["checkpoint"] = str(model_path)
+
     stem = f"r2dreamer_{DATETIME}_{args.task}"
     steps_path = output_dir / f"{stem}_step_stats.csv"
     episodes_path = output_dir / f"{stem}_episode_stats.csv"
+    prediction_path = output_dir / f"{stem}_prediction_stats.csv"
     summary_path = output_dir / f"{stem}_summary.csv"
-    manifest_path = output_dir / "evaluation_manifest.json"
     write_csv(steps_path, step_rows)
     write_csv(episodes_path, episode_rows)
-    write_csv(
-        summary_path,
-        [evaluation_summary(args.task, max_steps, episode_rows)],
-    )
+    if prediction_rows:
+        write_csv(prediction_path, prediction_rows)
+    summary = evaluation_summary(args.task, max_steps, episode_rows)
+    summary["checkpoint"] = str(model_path)
+    write_csv(summary_path, [summary])
+
+    manifest_path = output_dir / "evaluation_manifest.json"
     manifest = {
         "created_at": DATETIME,
         "task": args.task,
@@ -784,24 +1196,31 @@ def main() -> None:
         "config": str(config_path),
         "episodes": episodes,
         "max_steps": max_steps,
-        "first_seed": args.seed,
+        "first_environment_seed": args.seed,
+        "first_latent_seed": args.seed + 1_000_000_000,
+        "condition_schedule": (
+            "seeded_balanced_2x2"
+            if args.task in {"imagine", "partition"}
+            else None
+        ),
         "stochastic_policy": args.stochastic,
-        "video_recorded": recorder is not None,
-        "video_fps": args.video_fps if recorder is not None else None,
+        "imagination_anchor_delay": (
+            args.imagination_anchor_delay if args.task == "imagine" else None
+        ),
+        "imagination_horizon": (
+            args.imagination_horizon if args.task == "imagine" else None
+        ),
+        "video_recorded": not args.no_video,
+        "video_fps": args.video_fps if not args.no_video else None,
         "video_resolution": (
-            [args.video_size, args.video_size] if recorder is not None else None
+            [args.video_size, args.video_size] if not args.no_video else None
         ),
         "policy_resolution": list(map(int, config.env.size)),
     }
     with manifest_path.open("w", encoding="utf-8") as file:
         json.dump(manifest, file, indent=2)
-    print(f"Saved step statistics to {steps_path}")
-    print(f"Saved episode statistics to {episodes_path}")
-    print(f"Saved evaluation summary to {summary_path}")
+    print(f"Saved evaluation to {output_dir}")
     print(f"Saved evaluation manifest to {manifest_path}")
-    if recorder is not None:
-        print(f"Saved POV video to {recorder.pov_path}")
-        print(f"Saved environment video to {recorder.env_path}")
 
 
 if __name__ == "__main__":

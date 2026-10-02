@@ -16,7 +16,7 @@ class EnvConfig(BaseConfig):
     # and avoids frequent synchronous SQLite writes.
     comparison_metrics_interval: int = 50_000
     arena_size: float = 6.0
-    shift: bool = False
+    imagine: bool = False
     training_initial_bounds: float = 0.2
     day_night_cycle_len: int = 1
     object_spacing: float = 2.0

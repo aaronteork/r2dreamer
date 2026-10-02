@@ -198,6 +198,7 @@ class PartitionRecallEnv(HomeostaticAntEnv):
         self._initial_water_side = ""
         self._initial_food_position = np.full(2, np.nan, dtype=np.float64)
         self._initial_water_position = np.full(2, np.nan, dtype=np.float64)
+        self._reset_options: dict[str, str] = {}
 
         self.action_space = spaces.Box(
             low=-1.0, high=1.0, shape=(8,), dtype=np.float32
@@ -323,7 +324,16 @@ class PartitionRecallEnv(HomeostaticAntEnv):
         secondary = self.np_random.uniform(
             self.cfg.secondary_need_low, self.cfg.secondary_need_high
         )
-        if self.np_random.random() < 0.5:
+        dominant_need = self._reset_options.get("dominant_need")
+        if dominant_need is None:
+            dominant_need = (
+                "hunger" if self.np_random.random() < 0.5 else "thirst"
+            )
+        if dominant_need not in {"hunger", "thirst"}:
+            raise ValueError(
+                "partition dominant_need must be 'hunger' or 'thirst'"
+            )
+        if dominant_need == "hunger":
             self.hunger, self.thirst = primary, secondary
         else:
             self.hunger, self.thirst = secondary, primary
@@ -353,7 +363,12 @@ class PartitionRecallEnv(HomeostaticAntEnv):
         right = self.cfg.right_resource_sites[
             int(self.np_random.integers(len(self.cfg.right_resource_sites)))
         ]
-        if self.np_random.random() < 0.5:
+        food_side = self._reset_options.get("food_side")
+        if food_side is None:
+            food_side = "left" if self.np_random.random() < 0.5 else "right"
+        if food_side not in {"left", "right"}:
+            raise ValueError("partition food_side must be 'left' or 'right'")
+        if food_side == "left":
             food, water = left, right
             self._initial_food_side, self._initial_water_side = "left", "right"
             self.object = [("food", *left), ("water", *right)]
