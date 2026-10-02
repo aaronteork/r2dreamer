@@ -43,5 +43,5 @@ class PartitionConfig(EnvConfig):
     # within the range encountered by the training environment.
     primary_need_low: float = -0.5
     primary_need_high: float = -0.4
-    secondary_need_low: float = -0.2
-    secondary_need_high: float = -0.1
+    secondary_need_low: float = -0.3
+    secondary_need_high: float = -0.2

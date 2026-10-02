@@ -194,6 +194,10 @@ class PartitionRecallEnv(HomeostaticAntEnv):
         self._previous_ant_pos: np.ndarray | None = None
         self._initial_hunger = 0.0
         self._initial_thirst = 0.0
+        self._initial_food_side = ""
+        self._initial_water_side = ""
+        self._initial_food_position = np.full(2, np.nan, dtype=np.float64)
+        self._initial_water_position = np.full(2, np.nan, dtype=np.float64)
 
         self.action_space = spaces.Box(
             low=-1.0, high=1.0, shape=(8,), dtype=np.float32
@@ -350,9 +354,15 @@ class PartitionRecallEnv(HomeostaticAntEnv):
             int(self.np_random.integers(len(self.cfg.right_resource_sites)))
         ]
         if self.np_random.random() < 0.5:
+            food, water = left, right
+            self._initial_food_side, self._initial_water_side = "left", "right"
             self.object = [("food", *left), ("water", *right)]
         else:
+            food, water = right, left
+            self._initial_food_side, self._initial_water_side = "right", "left"
             self.object = [("water", *left), ("food", *right)]
+        self._initial_food_position = np.asarray(food, dtype=np.float64)
+        self._initial_water_position = np.asarray(water, dtype=np.float64)
 
         if not all(self._resource_visible(resource) for resource in self.object):
             raise RuntimeError(
@@ -540,6 +550,12 @@ class PartitionRecallEnv(HomeostaticAntEnv):
             "resources_consumed": list(self.resources_consumed),
             "initial_hunger": np.array(self._initial_hunger),
             "initial_thirst": np.array(self._initial_thirst),
+            "initial_food_side": self._initial_food_side,
+            "initial_water_side": self._initial_water_side,
+            "initial_food_x": np.array(self._initial_food_position[0]),
+            "initial_food_y": np.array(self._initial_food_position[1]),
+            "initial_water_x": np.array(self._initial_water_position[0]),
+            "initial_water_y": np.array(self._initial_water_position[1]),
             "ant_x": np.array(ant_pos[0]),
             "ant_y": np.array(ant_pos[1]),
             "remaining_resource_x": np.array(remaining_x),
