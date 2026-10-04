@@ -78,7 +78,8 @@ dreamer_pro:
     bilinear: True
 
 rssm:
-  recurrent: 'gru' # gru/sru
+  recurrent: 'gru' # gru/sru/action_visual_sru (opt-in Action + Vision)
+  # action_visual_sru requires both legacy flags below to remain false.
   use_motion_sru: ${model.use_motion_sru}
   use_visual_spatial: ${model.use_visual_spatial}
   spatial_modulation: true

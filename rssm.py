@@ -256,6 +256,67 @@ class MotionVisualSRUDeter(MotionSRUDeter):
         return update * cand + (1 - update) * deter
 
 
+class ActionVisualSRUDeter(Deter):
+    """Candidate SRU driven by the supplied action and predicted camera feature.
+
+    Predict v_t from (h_{t-1}, z_{t-1}, a_{t-1}), then form the multiplier
+    from [a_{t-1}, predicted v_t]. No current observation or motion target is
+    read here, so posterior updates and imagination share the same path.
+    """
+
+    def __init__(
+        self, deter, stoch, act_dim, hidden, blocks, dynlayers,
+        act="SiLU", visual_dim=1024,
+    ):
+        super().__init__(deter, stoch, act_dim, hidden, blocks, dynlayers, act)
+        self.deter = int(deter)
+        self.act_dim = int(act_dim)
+        self.visual_dim = int(visual_dim)
+        self.use_visual_spatial = True
+        act_fn = getattr(torch.nn, act)
+        self._visual_pred = nn.Sequential(
+            nn.Linear(3 * self.hidden, self.hidden, bias=True),
+            nn.RMSNorm(self.hidden, eps=1e-04, dtype=torch.float32),
+            act_fn(),
+            nn.Linear(self.hidden, self.hidden, bias=True),
+            nn.RMSNorm(self.hidden, eps=1e-04, dtype=torch.float32),
+            act_fn(),
+            nn.Linear(self.hidden, self.hidden, bias=True),
+            nn.RMSNorm(self.hidden, eps=1e-04, dtype=torch.float32),
+            act_fn(),
+            nn.Linear(self.hidden, self.visual_dim, bias=True),
+        )
+        self._spatial_transform = nn.Linear(
+            self.act_dim + self.visual_dim, self.deter, bias=True
+        )
+        self.reset_spatial_parameters()
+        self._last_visual_pred = None
+        self._last_spatial_input = None
+        self._last_spatial = None
+
+    def reset_spatial_parameters(self):
+        with torch.no_grad():
+            nn.init.zeros_(self._spatial_transform.weight)
+            nn.init.ones_(self._spatial_transform.bias)
+
+    def forward(self, stoch, deter, action):
+        x0, x1, x2 = self._project_inputs(stoch, deter, action)
+        visual_pred = self._visual_pred(torch.cat([x0, x1, x2], dim=-1))
+        # Use the actual supplied action, not a predicted motion or embedding.
+        # _project_inputs retains the existing bounded-action predictor path.
+        spatial_input = torch.cat([action, visual_pred], dim=-1)
+        spatial = self._spatial_transform(spatial_input)
+        self._last_visual_pred = visual_pred
+        self._last_spatial_input = spatial_input
+        self._last_spatial = spatial.detach()
+
+        reset, cand, update = self._gate_preactivations(deter, x0, x1, x2)
+        reset = torch.sigmoid(reset)
+        cand = torch.tanh(spatial * reset * cand)
+        update = torch.sigmoid(update - 1)
+        return update * cand + (1 - update) * deter
+
+
 class RSSM(nn.Module):
     def __init__(self, config, embed_size, act_dim, proprio_dim=26, visual_dim=1024):
         super().__init__()
@@ -278,10 +339,18 @@ class RSSM(nn.Module):
         self._use_visual_spatial = bool(
             getattr(config, "use_visual_spatial", False)
         )
-        recurrent_cores = {"gru": Deter, "sru": SRUDeter}
+        recurrent_cores = {
+            "gru": Deter,
+            "sru": SRUDeter,
+            "action_visual_sru": ActionVisualSRUDeter,
+        }
         if self._recurrent not in recurrent_cores:
             choices = ", ".join(recurrent_cores)
             raise ValueError(f"rssm.recurrent must be one of {{{choices}}}, got {self._recurrent!r}")
+        if self._recurrent == "action_visual_sru" and (
+            self._use_motion_sru or self._use_visual_spatial
+        ):
+            raise ValueError("action_visual_sru requires legacy SRU flags to be false")
         if self._use_motion_sru and self._recurrent != "gru":
             raise ValueError(
                 "rssm.use_motion_sru=true requires rssm.recurrent='gru'; "
@@ -306,7 +375,7 @@ class RSSM(nn.Module):
         if self._recurrent == "sru":
             kwargs["proprio_dim"] = self._proprio_dim
             kwargs["spatial_modulation"] = getattr(config, "spatial_modulation", True)
-        if self._use_visual_spatial:
+        if self._use_visual_spatial or self._recurrent == "action_visual_sru":
             kwargs["visual_dim"] = int(visual_dim)
         if self._use_visual_spatial:
             deter_core = MotionVisualSRUDeter
@@ -342,7 +411,7 @@ class RSSM(nn.Module):
             LambdaLayer(lambda x: x.reshape(*x.shape[:-1], self._stoch, self._discrete)),
         )
         self.apply(weight_init_)
-        if isinstance(self._deter_net, (SRUDeter, MotionSRUDeter)):
+        if isinstance(self._deter_net, (SRUDeter, MotionSRUDeter, ActionVisualSRUDeter)):
             self._deter_net.reset_spatial_parameters()
         self._last_spatial_terms = None
         self._last_motion_preds = None
@@ -387,7 +456,9 @@ class RSSM(nn.Module):
         spatial_terms = []
         is_proprio_sru = isinstance(self._deter_net, SRUDeter)
         is_motion_sru = isinstance(self._deter_net, MotionSRUDeter)
-        track_spatial = is_motion_sru or (
+        is_action_visual_sru = isinstance(self._deter_net, ActionVisualSRUDeter)
+        track_visual = is_action_visual_sru or (is_motion_sru and self._deter_net.use_visual_spatial)
+        track_spatial = is_action_visual_sru or is_motion_sru or (
             is_proprio_sru and self._deter_net.spatial_modulation
         )
         for i in range(L):
@@ -400,8 +471,8 @@ class RSSM(nn.Module):
                 proprio_preds.append(self._deter_net._last_proprio_pred)
             if is_motion_sru:
                 motion_preds.append(self._deter_net._last_motion_pred)
-                if self._deter_net.use_visual_spatial:
-                    visual_preds.append(self._deter_net._last_visual_pred)
+            if track_visual:
+                visual_preds.append(self._deter_net._last_visual_pred)
             if track_spatial:
                 spatial_terms.append(self._deter_net._last_spatial)
         # (B, T, S, K), (B, T, D), (B, T, S, K)
@@ -416,7 +487,7 @@ class RSSM(nn.Module):
             self._last_motion_preds = torch.stack(motion_preds, dim=1)
         else:
             self._last_motion_preds = None
-        if is_motion_sru and self._deter_net.use_visual_spatial:
+        if track_visual:
             self._last_visual_preds = torch.stack(visual_preds, dim=1)
         else:
             self._last_visual_preds = None

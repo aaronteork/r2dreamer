@@ -65,8 +65,8 @@ def _masked_motion_mse(prediction, target, is_first):
     return (squared_error * valid).sum() / valid.sum().clamp_min(1.0)
 
 
-def _masked_visual_mse(prediction, target, is_first):
-    """MSE for aligned CNN features, excluding synthetic reset rows."""
+def _masked_visual_mse(prediction, target, is_first, *, feature_reduction="mean"):
+    """Reduce feature errors, then average over non-reset transitions."""
     if prediction.shape != target.shape or prediction.shape[-1] != 1024:
         raise ValueError(
             "visual prediction and target must have identical (..., 1024) "
@@ -77,6 +77,12 @@ def _masked_visual_mse(prediction, target, is_first):
     target = to_f32(target)
     valid = _motion_valid_mask(prediction, is_first)
     squared_error = (prediction - target).square()
+    if feature_reduction == "sum":
+        # Count transitions, not individual feature elements. Keep the legacy
+        # mean branch below unchanged for Motion + Visual checkpoints/runs.
+        return (squared_error * valid).sum() / valid[..., 0].sum().clamp_min(1.0)
+    if feature_reduction != "mean":
+        raise ValueError(f"Unknown visual feature reduction: {feature_reduction!r}")
     return (squared_error * valid).sum() / valid.sum().clamp_min(1.0)
 
 
@@ -119,6 +125,10 @@ class Dreamer(nn.Module):
             raise ValueError(
                 "use_visual_spatial=true requires use_motion_sru=true"
             )
+        self.use_action_visual_sru = (
+            str(getattr(config.rssm, "recurrent", "gru")) == "action_visual_sru"
+        )
+        self.use_visual_spatial = self.use_visual_spatial or self.use_action_visual_sru
 
         # World model components
         shapes = {k: tuple(v.shape) for k, v in obs_space.spaces.items()}
@@ -127,12 +137,12 @@ class Dreamer(nn.Module):
         if self.use_visual_spatial:
             if tuple(self.encoder.cnn_shapes) != ("image",):
                 raise ValueError(
-                    "Motion+Visual-SRU requires exactly one CNN observation "
+                    "Visual spatial SRU requires exactly one CNN observation "
                     "key named 'image'"
                 )
             if self.encoder.cnn_out_dim != 1024:
                 raise ValueError(
-                    "Motion+Visual-SRU requires the 1024-D flattened camera "
+                    "Visual spatial SRU requires the 1024-D flattened camera "
                     f"CNN output, got {self.encoder.cnn_out_dim}"
                 )
         proprio_dim = shapes.get("proprioception", (26,))[0] if "proprioception" in shapes else 26
@@ -249,6 +259,8 @@ class Dreamer(nn.Module):
             self._loss_scales["motion"] = self.motion_loss_scale
             if self.rssm._deter_net.use_visual_spatial:
                 self._loss_scales["visual_prediction"] = self.visual_loss_scale
+        if self.use_action_visual_sru:
+            self._loss_scales["visual_prediction"] = self.visual_loss_scale
         # count number of parameters in each module
         for key, module in modules.items():
             if isinstance(module, nn.Parameter):
@@ -612,14 +624,15 @@ class Dreamer(nn.Module):
             visual_pred = self.rssm.last_visual_preds
             if visual_pred is None or visual_target is None:
                 raise RuntimeError(
-                    "Motion+Visual-SRU did not produce aligned visual "
+                    "Visual spatial SRU did not produce aligned visual "
                     "predictions and CNN targets"
                 )
             # Stop-gradient is applied only to the teacher. visual_pred stays
             # attached to both this loss and the recurrent spatial pathway.
             visual_target = to_f32(visual_target.detach())
             visual_loss = _masked_visual_mse(
-                visual_pred, visual_target, data["is_first"]
+                visual_pred, visual_target, data["is_first"],
+                feature_reduction="sum" if self.use_action_visual_sru else "mean",
             )
             losses["visual_prediction"] = visual_loss
             metrics["visual_prediction_loss_raw"] = visual_loss.detach()
@@ -643,7 +656,11 @@ class Dreamer(nn.Module):
             metrics["visual_target_std"] = torch.sqrt(
                 _masked_mean((visual_target - target_mean).square(), valid)
             )
-            metrics["visual_prediction_mse"] = visual_loss.detach()
+            # Keep the MSE diagnostic per feature even when the loss sums them.
+            metrics["visual_prediction_mse"] = (
+                visual_loss.detach() / visual_pred.shape[-1]
+                if self.use_action_visual_sru else visual_loss.detach()
+            )
             cosine = F.cosine_similarity(
                 visual_pred_detached, visual_target, dim=-1
             ).unsqueeze(-1)
