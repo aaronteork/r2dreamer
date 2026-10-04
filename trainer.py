@@ -168,7 +168,7 @@ class OnlineTrainer:
             if len(cache) < self.batch_length:
                 cache.append(trans.clone())
             # (B, A)
-            act, agent_state = agent.act(trans, agent_state, eval=True)
+            act, agent_state = agent.act(trans, agent_state)
             returns += trans["reward"][:, 0] * stepped
             for key, value in trans.items():
                 if key.startswith("log_"):

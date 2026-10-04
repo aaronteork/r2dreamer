@@ -763,7 +763,6 @@ def evaluate_imagination(
             action, state = agent.act(
                 observation_batch(observation, agent.device),
                 state,
-                eval=not stochastic,
             )
             if steps_after_consumption == anchor_delay and anchor is None:
                 anchor = (state["stoch"].clone(), state["deter"].clone())
@@ -976,7 +975,6 @@ def evaluate(
             action, state = agent.act(
                 observation_batch(observation, agent.device),
                 state,
-                eval=not stochastic,
             )
             observation, reward, done, info = env.step(
                 action.squeeze(0).detach().cpu().numpy()

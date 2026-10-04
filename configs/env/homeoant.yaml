@@ -3,7 +3,7 @@ task: 'homeoant_ant'
 # Use one environment for initial integration testing.
 steps: 3.0e6
 env_num: 16
-eval_episode_num: 5
+eval_episode_num: 0
 eval_max_steps: 60000
 eval_initial_bounds: 0.0
 survival_eval: true

@@ -231,7 +231,7 @@ def run_episode_batch(
 
         while active.any():
             actions, state = agent.act(
-                observation_batch(observations, agent.device), state, eval=True
+                observation_batch(observations, agent.device), state
             )
             observations, _, terminated, truncated, infos = envs.step(
                 actions.detach().cpu().numpy()
