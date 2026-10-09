@@ -382,20 +382,36 @@ class Dreamer(nn.Module):
         return self
 
     @torch.no_grad()
-    def act(self, obs, state, eval=False):
-        """Policy inference step."""
+    def act(self, obs, state, eval=False, *, sru_visual_source="predicted"):
+        """Policy step; observed SRU features are an explicit evaluation diagnostic."""
         # obs: dict of (B, *), state: (stoch: (B, S, K), deter: (B, D), prev_action: (B, A))
         torch.compiler.cudagraph_mark_step_begin()
         p_obs = self.preprocess(obs)
         # (B, E)
-        embed = self._frozen_encoder(p_obs)
+        if sru_visual_source not in {"predicted", "observed"}:
+            raise ValueError("sru_visual_source must be 'predicted' or 'observed'")
+        visual_features = None
+        if sru_visual_source == "observed":
+            if self.training:
+                raise ValueError("Observed SRU visual features require agent.eval()")
+            if not self.use_action_visual_sru:
+                raise ValueError("Observed SRU visual features require action_visual_sru")
+            embed, visual_features = self._frozen_encoder.forward_with_cnn(p_obs)
+        else:
+            embed = self._frozen_encoder(p_obs)
         prev_stoch, prev_deter, prev_action = (
             state["stoch"],
             state["deter"],
             state["prev_action"],
         )
         # (B, S, K), (B, D)
-        stoch, deter, _ = self._frozen_rssm.obs_step(prev_stoch, prev_deter, prev_action, embed, obs["is_first"])
+        if visual_features is None:
+            stoch, deter, _ = self._frozen_rssm.obs_step(prev_stoch, prev_deter, prev_action, embed, obs["is_first"])
+        else:
+            stoch, deter, _ = self._frozen_rssm.obs_step(
+                prev_stoch, prev_deter, prev_action, embed, obs["is_first"],
+                visual_features=visual_features,
+            )
         # (B, F)
         feat = self._frozen_rssm.get_feat(stoch, deter)
         action_dist = self._frozen_actor(feat)

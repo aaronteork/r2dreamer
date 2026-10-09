@@ -261,7 +261,9 @@ class ActionVisualSRUDeter(Deter):
 
     Predict v_t from (h_{t-1}, z_{t-1}, a_{t-1}), then form the multiplier
     from [a_{t-1}, predicted v_t]. No current observation or motion target is
-    read here, so posterior updates and imagination share the same path.
+    read by default, so posterior updates and imagination share the same path.
+    Evaluation observation updates may explicitly substitute current CNN features;
+    imagination always retains the prediction-only path.
     """
 
     def __init__(
@@ -299,12 +301,18 @@ class ActionVisualSRUDeter(Deter):
             nn.init.zeros_(self._spatial_transform.weight)
             nn.init.ones_(self._spatial_transform.bias)
 
-    def forward(self, stoch, deter, action):
+    def forward(self, stoch, deter, action, visual_features=None):
         x0, x1, x2 = self._project_inputs(stoch, deter, action)
         visual_pred = self._visual_pred(torch.cat([x0, x1, x2], dim=-1))
+        if visual_features is not None:
+            if self.training:
+                raise ValueError("Observed SRU visual features are evaluation-only")
+            if visual_features.shape != visual_pred.shape:
+                raise ValueError("Observed SRU features must match the predicted CNN feature shape")
         # Use the actual supplied action, not a predicted motion or embedding.
         # _project_inputs retains the existing bounded-action predictor path.
-        spatial_input = torch.cat([action, visual_pred], dim=-1)
+        spatial_visual = visual_pred if visual_features is None else visual_features
+        spatial_input = torch.cat([action, spatial_visual], dim=-1)
         spatial = self._spatial_transform(spatial_input)
         self._last_visual_pred = visual_pred
         self._last_spatial_input = spatial_input
@@ -494,7 +502,7 @@ class RSSM(nn.Module):
         self._last_spatial_terms = torch.stack(spatial_terms, dim=1) if track_spatial else None
         return stochs, deters, logits
 
-    def obs_step(self, stoch, deter, prev_action, embed, reset):
+    def obs_step(self, stoch, deter, prev_action, embed, reset, visual_features=None):
         """Single posterior step."""
         # (B, S, K), (B, D), (B, A), (B, E), (B,)
         stoch = torch.where(rpad(reset, stoch.dim() - int(reset.dim())), torch.zeros_like(stoch), stoch)
@@ -505,7 +513,12 @@ class RSSM(nn.Module):
 
         # Deterministic transition then posterior logits conditioned on embed.
         # (B, D)
-        deter = self._deter_net(stoch, deter, prev_action)
+        if visual_features is None:
+            deter = self._deter_net(stoch, deter, prev_action)
+        else:
+            if not isinstance(self._deter_net, ActionVisualSRUDeter):
+                raise ValueError("Observed SRU features require action_visual_sru")
+            deter = self._deter_net(stoch, deter, prev_action, visual_features=visual_features)
         # (B, D + E)
         x = torch.cat([deter, embed], dim=-1)
         # (B, S, K)

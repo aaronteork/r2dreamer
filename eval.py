@@ -22,6 +22,11 @@ Evaluate notebook-style imagination from the run's latest checkpoint::
 Evaluate zero-shot landmark recall in the partitioned open field::
 
     python eval.py --task partition --run-dir logdir/homeostatic-ant
+
+Use observed camera features for Action-Visual SRU evaluation only::
+
+    python eval.py --task partition --run-dir logdir/homeostatic-ant \
+        --sru-visual-source observed
 """
 
 from __future__ import annotations
@@ -104,6 +109,10 @@ def parse_args() -> argparse.Namespace:
         "--stochastic",
         action="store_true",
         help="Sample policy actions instead of using the distribution mode.",
+    )
+    parser.add_argument(
+        "--sru-visual-source", choices=("predicted", "observed"), default="predicted",
+        help="Action-Visual SRU modulation during real observation updates; imagination always uses predicted features.",
     )
     parser.add_argument(
         "--no-video", action="store_true", help="Do not record evaluation videos."
@@ -727,6 +736,7 @@ def evaluate_imagination(
     horizon: int,
     image_dir: Path,
     recorder: VideoRecorder | None,
+    sru_visual_source: str = "predicted",
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
     """Run the notebook protocol and save one labelled rollout grid per episode."""
     if not hasattr(agent, "decoder"):
@@ -763,6 +773,7 @@ def evaluate_imagination(
             action, state = agent.act(
                 observation_batch(observation, agent.device),
                 state,
+                sru_visual_source=sru_visual_source,
             )
             if steps_after_consumption == anchor_delay and anchor is None:
                 anchor = (state["stoch"].clone(), state["deter"].clone())
@@ -951,6 +962,7 @@ def evaluate(
     first_seed: int,
     stochastic: bool,
     recorder: VideoRecorder | None,
+    sru_visual_source: str = "predicted",
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     step_rows: list[dict[str, Any]] = []
     episode_rows: list[dict[str, Any]] = []
@@ -975,6 +987,7 @@ def evaluate(
             action, state = agent.act(
                 observation_batch(observation, agent.device),
                 state,
+                sru_visual_source=sru_visual_source,
             )
             observation, reward, done, info = env.step(
                 action.squeeze(0).detach().cpu().numpy()
@@ -1133,6 +1146,8 @@ def main() -> None:
     try:
         print(f"Evaluating checkpoint: {model_path.name}", flush=True)
         agent = load_agent(model_path, config, env, device)
+        if args.sru_visual_source == "observed" and not agent.use_action_visual_sru:
+            raise ValueError("--sru-visual-source observed requires an action_visual_sru checkpoint")
         if not args.no_video:
             recorder = VideoRecorder(
                 output_dir,
@@ -1152,6 +1167,7 @@ def main() -> None:
                 horizon=args.imagination_horizon,
                 image_dir=output_dir / "imagination",
                 recorder=recorder,
+                sru_visual_source=args.sru_visual_source,
             )
         else:
             step_rows, episode_rows = evaluate(
@@ -1163,6 +1179,7 @@ def main() -> None:
                 first_seed=args.seed,
                 stochastic=args.stochastic,
                 recorder=recorder,
+                sru_visual_source=args.sru_visual_source,
             )
     finally:
         if recorder is not None:
@@ -1172,6 +1189,7 @@ def main() -> None:
     for rows in (step_rows, episode_rows, prediction_rows):
         for row in rows:
             row["checkpoint"] = str(model_path)
+            row["sru_visual_source"] = args.sru_visual_source
 
     stem = f"r2dreamer_{DATETIME}_{args.task}"
     steps_path = output_dir / f"{stem}_step_stats.csv"
@@ -1184,6 +1202,7 @@ def main() -> None:
         write_csv(prediction_path, prediction_rows)
     summary = evaluation_summary(args.task, max_steps, episode_rows)
     summary["checkpoint"] = str(model_path)
+    summary["sru_visual_source"] = args.sru_visual_source
     write_csv(summary_path, [summary])
 
     manifest_path = output_dir / "evaluation_manifest.json"
@@ -1202,6 +1221,7 @@ def main() -> None:
             else None
         ),
         "stochastic_policy": args.stochastic,
+        "sru_visual_source": args.sru_visual_source,
         "imagination_anchor_delay": (
             args.imagination_anchor_delay if args.task == "imagine" else None
         ),

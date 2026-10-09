@@ -43,6 +43,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--max-steps", type=int, default=60_000, help="Administrative per-episode survival cutoff.")
     parser.add_argument("--seed", type=int, default=0, help="First episode seed; one is added for every episode.")
+    parser.add_argument("--sru-visual-source", choices=("predicted", "observed"), default="predicted", help="Action-Visual SRU features for real observation updates.")
     parser.add_argument("--device", default=None, help="Torch device (defaults to CUDA when available).")
     parser.add_argument("--output-dir", type=Path, default=Path("survival_evaluation"), help="Output directory.")
     args = parser.parse_args()
@@ -212,6 +213,7 @@ def run_episode_batch(
     camera_fovy: float,
     seeds: list[int],
     max_steps: int,
+    sru_visual_source: str = "predicted",
 ) -> list[dict[str, Any]]:
     envs = gym.vector.AsyncVectorEnv(
         [
@@ -231,7 +233,8 @@ def run_episode_batch(
 
         while active.any():
             actions, state = agent.act(
-                observation_batch(observations, agent.device), state
+                observation_batch(observations, agent.device), state,
+                sru_visual_source=sru_visual_source,
             )
             observations, _, terminated, truncated, infos = envs.step(
                 actions.detach().cpu().numpy()
@@ -274,6 +277,9 @@ def run_episode_batch(
 def evaluate_checkpoint(args: argparse.Namespace, step: int, checkpoint: Path, config: Any, device: torch.device) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     set_seed_everywhere(args.seed)
     agent = load_agent(checkpoint, config, device)
+    visual_source = getattr(args, "sru_visual_source", "predicted")
+    if visual_source == "observed" and not agent.use_action_visual_sru:
+        raise ValueError("--sru-visual-source observed requires an action_visual_sru checkpoint")
     image_size = tuple(map(int, config.env.size))
     camera_fovy = float(getattr(config.env, "camera_fovy", 90.0))
     configured_workers = int(getattr(config.env, "env_num", args.episodes))
@@ -290,12 +296,14 @@ def evaluate_checkpoint(args: argparse.Namespace, step: int, checkpoint: Path, c
                 camera_fovy,
                 batch_seeds,
                 args.max_steps,
+                sru_visual_source=visual_source,
             )
         )
     lengths = np.asarray([episode["survival_steps"] for episode in episodes], dtype=np.float64)
     row = {
         "checkpoint_step": step, "checkpoint": str(checkpoint), "episodes": args.episodes,
         "max_steps": args.max_steps, "seed": args.seed,
+        "sru_visual_source": visual_source,
         "mean_survival_steps": float(lengths.mean()), "median_survival_steps": float(np.median(lengths)),
         "min_survival_steps": int(lengths.min()), "max_survival_steps": int(lengths.max()),
         "survival_rate_to_cutoff": float(sum(item["outcome"] == "evaluation_cutoff" for item in episodes) / args.episodes),
@@ -304,7 +312,7 @@ def evaluate_checkpoint(args: argparse.Namespace, step: int, checkpoint: Path, c
         "evaluation_cutoffs": sum(item["outcome"] == "evaluation_cutoff" for item in episodes),
     }
     for episode in episodes:
-        episode.update({"checkpoint_step": step, "checkpoint": str(checkpoint)})
+        episode.update({"checkpoint_step": step, "checkpoint": str(checkpoint), "sru_visual_source": visual_source})
     return row, episodes
 
 
