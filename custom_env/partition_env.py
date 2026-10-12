@@ -183,6 +183,8 @@ class PartitionRecallEnv(HomeostaticAntEnv):
         self.second_resource_step = -1
         self.target_reacquisition_step = -1
         self.second_leg_distance = 0.0
+        self.total_distance = 0.0
+        self.shortest_total_distance = float("nan")
         self.occluded_second_leg_distance = 0.0
         self.shortest_second_leg_distance = float("nan")
         self.initial_target_bearing_error_rad = float("nan")
@@ -300,6 +302,24 @@ class PartitionRecallEnv(HomeostaticAntEnv):
             + np.linalg.norm(target - second)
         )
 
+    def _approximate_total_path(self, start, first, second) -> float:
+        """Geometric ordered-collection baseline; ignores camera heading.
+
+        Sample the first collection disk and shorten the final segment by the
+        interaction radius. Uses the same partition clearance as second-leg
+        efficiency; this is an approximate route, not an Ant dynamics optimum.
+        """
+        radius = self.cfg.object_interaction_dist * (1.0 - 1e-6)
+        angles = np.linspace(0.0, 2.0 * np.pi, 128, endpoint=False)
+        points = first + radius * np.stack([np.cos(angles), np.sin(angles)], axis=-1)
+        points = np.concatenate([points, first[None]], axis=0)
+        return min(
+            self._approximate_shortest_path(start, point)
+            + max(0.0, self._approximate_shortest_path(point, second) - radius)
+            for point in points
+            if not self._segment_intersects_partition(point, point, margin=self.cfg.path_clearance)
+        )
+
     def reset_model(self):
         self.current_step = 0
         self.food_consumed = 0
@@ -309,6 +329,8 @@ class PartitionRecallEnv(HomeostaticAntEnv):
         self.second_resource_step = -1
         self.target_reacquisition_step = -1
         self.second_leg_distance = 0.0
+        self.total_distance = 0.0
+        self.shortest_total_distance = float("nan")
         self.occluded_second_leg_distance = 0.0
         self.shortest_second_leg_distance = float("nan")
         self.initial_target_bearing_error_rad = float("nan")
@@ -378,6 +400,14 @@ class PartitionRecallEnv(HomeostaticAntEnv):
             self.object = [("water", *left), ("food", *right)]
         self._initial_food_position = np.asarray(food, dtype=np.float64)
         self._initial_water_position = np.asarray(water, dtype=np.float64)
+        first, second = (
+            (self._initial_food_position, self._initial_water_position)
+            if self._initial_hunger < self._initial_thirst
+            else (self._initial_water_position, self._initial_food_position)
+        )
+        self.shortest_total_distance = self._approximate_total_path(
+            self._previous_ant_pos, first, second
+        )
 
         if not all(self._resource_visible(resource) for resource in self.object):
             raise RuntimeError(
@@ -440,6 +470,7 @@ class PartitionRecallEnv(HomeostaticAntEnv):
             else float(np.linalg.norm(ant_pos - self._previous_ant_pos))
         )
         self._previous_ant_pos = ant_pos.copy()
+        self.total_distance += displacement
         if self.first_resource_step >= 0 and self.second_resource_step < 0:
             self.second_leg_distance += displacement
             if self.target_reacquisition_step < 0:
@@ -528,6 +559,13 @@ class PartitionRecallEnv(HomeostaticAntEnv):
         observation = self._get_obs()
 
         path_efficiency = float("nan")
+        expected_first = "food" if self._initial_hunger < self._initial_thirst else "water"
+        expected_sequence = [expected_first, "water" if expected_first == "food" else "food"]
+        total_path_efficiency = (
+            min(1.0, self.shortest_total_distance / self.total_distance)
+            if self.resources_consumed == expected_sequence and self.total_distance > 0.0
+            else 0.0
+        )
         if self.second_leg_distance > 0.0 and np.isfinite(
             self.shortest_second_leg_distance
         ):
@@ -586,6 +624,9 @@ class PartitionRecallEnv(HomeostaticAntEnv):
             "second_leg_latency": np.array(second_leg_latency),
             "target_reacquisition_latency": np.array(reacquisition_latency),
             "second_leg_distance": np.array(self.second_leg_distance),
+            "total_distance": np.array(self.total_distance),
+            "shortest_total_distance": np.array(self.shortest_total_distance),
+            "total_path_efficiency": np.array(total_path_efficiency),
             "occluded_second_leg_distance": np.array(
                 self.occluded_second_leg_distance
             ),

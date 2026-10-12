@@ -27,6 +27,12 @@ Use observed camera features for Action-Visual SRU evaluation only::
 
     python eval.py --task partition --run-dir logdir/homeostatic-ant \
         --sru-visual-source observed
+
+Partition CSVs include total torso XY distance (metres), an approximate ordered
+collection route baseline, total path efficiency, and the second-leg distance
+metrics. Total efficiency is zero unless both resources are collected in the
+required order. The summary reports finite-value means, population standard
+deviations and counts across seeds, plus total efficiency among successes.
 """
 
 from __future__ import annotations
@@ -55,6 +61,18 @@ from tools import set_seed_everywhere
 
 DATETIME = dt.datetime.now(ZoneInfo("Asia/Singapore")).strftime(
     "%Y-%m-%d_%H-%M-%S"
+)
+
+# Distances are accumulated torso XY travel in metres. Total efficiency is
+# success-weighted; the second-leg efficiency retains the environment's ratio.
+PARTITION_PATH_METRICS = (
+    "total_distance",
+    "shortest_total_distance",
+    "total_path_efficiency",
+    "second_leg_distance",
+    "occluded_second_leg_distance",
+    "shortest_second_leg_distance",
+    "second_leg_path_efficiency",
 )
 
 
@@ -494,6 +512,9 @@ def episode_summary(
     ):
         if key in info:
             row[key] = scalar(info, key)
+    for key in PARTITION_PATH_METRICS:
+        if key in info:
+            row[key] = scalar(info, key)
     return row
 
 
@@ -563,7 +584,7 @@ def evaluation_summary(
             row.get("food_side") == "right" for row in rows
         )
     if task == "partition":
-        return {
+        partition_result = {
             key: result[key]
             for key in (
                 "task",
@@ -578,6 +599,18 @@ def evaluation_summary(
                 "food_right_episodes",
             )
         }
+        for key in PARTITION_PATH_METRICS:
+            values = np.asarray([row.get(key, float("nan")) for row in rows])
+            values = values[np.isfinite(values)]
+            partition_result[f"mean_{key}"] = float(np.mean(values)) if values.size else float("nan")
+            partition_result[f"std_{key}"] = float(np.std(values)) if values.size else float("nan")
+            partition_result[f"count_{key}"] = int(values.size)
+        successes = [row for row in rows if row.get("correct_resource_sequence", 0)]
+        partition_result["mean_total_path_efficiency_successful"] = (
+            float(np.mean([row["total_path_efficiency"] for row in successes]))
+            if successes else float("nan")
+        )
+        return partition_result
     if task == "imagine":
         predicted = [row for row in rows if "mean_actual_action_ssim" in row]
         result["imagination_completion_rate"] = float(
@@ -1029,6 +1062,9 @@ def evaluate(
                 "camera_inside_partition_frames",
             ):
                 if key in info:
+                    step_row[key] = scalar(info, key)
+            if task == "partition":
+                for key in PARTITION_PATH_METRICS:
                     step_row[key] = scalar(info, key)
             step_rows.append(step_row)
 
