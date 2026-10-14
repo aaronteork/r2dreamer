@@ -796,7 +796,7 @@ def evaluate_imagination(
         first_consumption_step: int | None = None
         steps_after_consumption: int | None = None
         anchor_step: int | None = None
-        anchor: tuple[torch.Tensor, torch.Tensor] | None = None
+        anchor: tuple[torch.Tensor, ...] | None = None
         anchor_image: np.ndarray | None = None
         future_actions: list[torch.Tensor] = []
         actual_images: list[np.ndarray] = []
@@ -810,6 +810,8 @@ def evaluate_imagination(
             )
             if steps_after_consumption == anchor_delay and anchor is None:
                 anchor = (state["stoch"].clone(), state["deter"].clone())
+                if agent.rssm.requires_action_history:
+                    anchor = (*anchor, state["incoming_action"].clone())
                 anchor_image = observation["image"].copy()
                 anchor_step = step - 1
 
@@ -892,7 +894,8 @@ def evaluate_imagination(
             actions = torch.stack(future_actions, dim=1)
             set_torch_seed(latent_seed + 10_000_000)
             actual_stoch, actual_deter = agent._frozen_rssm.imagine_with_action(
-                *anchor, actions
+                *anchor[:2], actions,
+                **({"preceding_action": anchor[2]} if agent.rssm.requires_action_history else {}),
             )
             actual_action_prediction = (
                 agent.decoder(actual_stoch, actual_deter)["image"]
@@ -902,14 +905,19 @@ def evaluate_imagination(
             )
 
             set_torch_seed(latent_seed + 20_000_000)
-            stoch, deter = (value.clone() for value in anchor)
+            stoch, deter = (value.clone() for value in anchor[:2])
+            if agent.rssm.requires_action_history:
+                incoming_action = anchor[2].clone()
             imagined_stoch, imagined_deter = [], []
             for _ in range(len(future_actions)):
                 feat = agent._frozen_rssm.get_feat(stoch, deter)
                 imagined_action = agent._frozen_actor(feat).rsample()
-                stoch, deter = agent._frozen_rssm.img_step(
-                    stoch, deter, imagined_action
-                )
+                if agent.rssm.requires_action_history:
+                    stoch, deter, incoming_action = agent._frozen_rssm.img_step(
+                        stoch, deter, imagined_action, preceding_action=incoming_action
+                    )
+                else:
+                    stoch, deter = agent._frozen_rssm.img_step(stoch, deter, imagined_action)
                 imagined_stoch.append(stoch)
                 imagined_deter.append(deter)
             imagined_prediction = (

@@ -145,12 +145,10 @@ class Dreamer(nn.Module):
                     "Visual spatial SRU requires the 1024-D flattened camera "
                     f"CNN output, got {self.encoder.cnn_out_dim}"
                 )
-        proprio_dim = shapes.get("proprioception", (26,))[0] if "proprioception" in shapes else 26
         self.rssm = rssm.RSSM(
             config.rssm,
             self.embed_size,
             self.act_dim,
-            proprio_dim=proprio_dim,
             visual_dim=self.encoder.cnn_out_dim or 1024,
         )
         self.reward = networks.MLPHead(config.reward, self.rssm.feat_size)
@@ -249,12 +247,6 @@ class Dreamer(nn.Module):
                 "ema_encoder": self._ema_encoder,
                 "ema_obs_proj": self._ema_obs_proj,
             })
-        if isinstance(self.rssm._deter_net, rssm.SRUDeter):
-            proprio_scale = float(self._loss_scales.get("proprioception", 1.0))
-            self._loss_scales.setdefault("proprio_pred", float(self._loss_scales.get("proprio_pred", proprio_scale)))
-            if bool(getattr(config, "adaptive_reconstruction", False)):
-                self.reconstruction_log_scales["proprio_pred"] = nn.Parameter(torch.zeros((), device=self.device))
-                modules["reconstruction_log_scales"] = self.reconstruction_log_scales
         if isinstance(self.rssm._deter_net, rssm.MotionSRUDeter):
             self._loss_scales["motion"] = self.motion_loss_scale
             if self.rssm._deter_net.use_visual_spatial:
@@ -405,7 +397,13 @@ class Dreamer(nn.Module):
             state["prev_action"],
         )
         # (B, S, K), (B, D)
-        if visual_features is None:
+        incoming_action = None
+        if self.rssm.requires_action_history:
+            stoch, deter, _, incoming_action = self._frozen_rssm.obs_step(
+                prev_stoch, prev_deter, prev_action, embed, obs["is_first"],
+                preceding_action=state["incoming_action"],
+            )
+        elif visual_features is None:
             stoch, deter, _ = self._frozen_rssm.obs_step(prev_stoch, prev_deter, prev_action, embed, obs["is_first"])
         else:
             stoch, deter, _ = self._frozen_rssm.obs_step(
@@ -417,16 +415,20 @@ class Dreamer(nn.Module):
         action_dist = self._frozen_actor(feat)
         # (B, A)
         action = action_dist.mode if eval else action_dist.rsample()
-        return action, TensorDict(
-            {"stoch": stoch, "deter": deter, "prev_action": action},
-            batch_size=state.batch_size,
-        )
+        next_state = {"stoch": stoch, "deter": deter, "prev_action": action}
+        if self.rssm.requires_action_history:
+            next_state["incoming_action"] = incoming_action
+        return action, TensorDict(next_state, batch_size=state.batch_size)
 
     @torch.no_grad()
     def get_initial_state(self, B):
-        stoch, deter = self.rssm.initial(B)
+        initial = self.rssm.initial(B)
+        stoch, deter = initial[:2]
         action = torch.zeros(B, self.act_dim, dtype=torch.float32, device=self.device)
-        return TensorDict({"stoch": stoch, "deter": deter, "prev_action": action}, batch_size=(B,))
+        state = {"stoch": stoch, "deter": deter, "prev_action": action}
+        if self.rssm.requires_action_history:
+            state["incoming_action"] = initial[2]
+        return TensorDict(state, batch_size=(B,))
 
     @torch.no_grad()
     def video_pred(self, data, initial):
@@ -455,6 +457,10 @@ class Dreamer(nn.Module):
             init_stoch,
             init_deter,
             data["action"][:B, 5:],
+            **({"preceding_action": torch.where(
+                data["is_first"][:B, 4, None], torch.zeros_like(data["action"][:B, 4]),
+                data["action"][:B, 4],
+            )} if self.rssm.requires_action_history else {}),
         )
         openl = self.decoder(prior_stoch, prior_deter)["image"].mode()
         model = torch.cat([recon[:, :5], openl], 1)
@@ -555,17 +561,6 @@ class Dreamer(nn.Module):
         dyn_loss, rep_loss = self.rssm.kl_loss(post_logit, prior_logit, self.kl_free)
         losses["dyn"] = torch.mean(dyn_loss)
         losses["rep"] = torch.mean(rep_loss)
-        if self.rssm.last_proprio_preds is not None and "proprioception" in data:
-            proprio_pred = self.rssm.last_proprio_preds
-            proprio_target = data["proprioception"]
-            proprio_loss = F.mse_loss(proprio_pred, proprio_target)
-            losses["proprio_pred"] = proprio_loss
-            metrics["proprio_pred_mse"] = proprio_loss.detach()
-            spatial_terms = self.rssm.last_spatial_terms
-            if spatial_terms is not None:
-                metrics["spatial_mean"] = spatial_terms.mean()
-                metrics["spatial_std"] = spatial_terms.std(unbiased=False)
-                metrics["spatial_abs_dev_from_1"] = (spatial_terms - 1.0).abs().mean()
         if self.rssm.last_motion_preds is not None:
             if "ego_motion" not in data:
                 raise KeyError(
@@ -722,11 +717,7 @@ class Dreamer(nn.Module):
             # DreamerPro uses augmentation + EMA targets + Sinkhorn assignment.
             with torch.no_grad():
                 data_aug = self.augment_data(data)
-                initial_aug = (
-                    # (B, ...) -> (2B, ...)
-                    torch.cat([initial[0], initial[0]], dim=0),
-                    torch.cat([initial[1], initial[1]], dim=0),
-                )
+                initial_aug = tuple(torch.cat([value, value], dim=0) for value in initial)
                 ema_proj = self.ema_proj(data_aug)
 
             embed_aug = self.encoder(data_aug)
@@ -751,6 +742,10 @@ class Dreamer(nn.Module):
             post_stoch.reshape(-1, *post_stoch.shape[2:]).detach(),
             post_deter.reshape(-1, *post_deter.shape[2:]).detach(),
         )
+        if self.rssm.requires_action_history:
+            incoming_action = torch.where(data["is_first"].unsqueeze(-1),
+                                          torch.zeros_like(data["action"]), data["action"])
+            start = (*start, incoming_action.reshape(-1, self.act_dim).detach())
         # (B, T, ...) -> (B*T, ...)
         imag_feat, imag_action = self._imagine(start, self.imag_horizon + 1)
         imag_feat, imag_action = imag_feat.detach(), imag_action.detach()
@@ -878,7 +873,9 @@ class Dreamer(nn.Module):
         # (B, S, K), (B, D)
         feats = []
         actions = []
-        stoch, deter = start
+        stoch, deter = start[:2]
+        if self.rssm.requires_action_history:
+            incoming_action = start[2]
         for _ in range(imag_horizon):
             # (B, F)
             feat = self._frozen_rssm.get_feat(stoch, deter)
@@ -887,7 +884,12 @@ class Dreamer(nn.Module):
             # Append feat and its corresponding sampled action at the same time step.
             feats.append(feat)
             actions.append(action)
-            stoch, deter = self._frozen_rssm.img_step(stoch, deter, action)
+            if self.rssm.requires_action_history:
+                stoch, deter, incoming_action = self._frozen_rssm.img_step(
+                    stoch, deter, action, preceding_action=incoming_action
+                )
+            else:
+                stoch, deter = self._frozen_rssm.img_step(stoch, deter, action)
 
         # Stack along sequence dim T_imag.
         # (B, T_imag, F), (B, T_imag, A)

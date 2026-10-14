@@ -274,7 +274,10 @@ class OnlineTrainer:
                 tools.to_np(
                     agent.video_pred(
                         cache[:1],  # give only first batch
-                        (initial["stoch"], initial["deter"]),
+                        tuple(initial[key] for key in (
+                            ("stoch", "deter", "incoming_action") if agent.rssm.requires_action_history
+                            else ("stoch", "deter")
+                        )),
                     )
                 ),
             )
@@ -345,11 +348,14 @@ class OnlineTrainer:
             act, agent_state = agent.act(trans.clone(), agent_state, eval=False)
 
             # Store transition.
-            # We keep the observation and the action that produced it together.
+            # Store o_t with the outgoing action a_t; Buffer.sample shifts it.
             # Mask actions after an episode has ended.
             trans["action"] = act * ~done.unsqueeze(-1)
             trans["stoch"] = agent_state["stoch"]
             trans["deter"] = agent_state["deter"]
+            if agent.rssm.requires_action_history:
+                # Immutable physical history for this posterior z_t: a_{t-1}.
+                trans["incoming_action"] = agent_state["incoming_action"]
             trans["episode"] = episode_ids  # Don't lift dim
             if "image" in trans:
                 video_cache.append(trans["image"][0])

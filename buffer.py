@@ -11,6 +11,7 @@ class Buffer:
         self.batch_size = int(config.batch_size)
         self.batch_length = int(config.batch_length)
         self.num_eps = 0
+        self.requires_action_history = getattr(config, "recurrent", "gru") == "sru"
         self._buffer = ReplayBuffer(
             storage=LazyTensorStorage(max_size=config.max_size, device=self.storage_device, ndim=2),
             sampler=SliceSampler(
@@ -37,6 +38,10 @@ class Buffer:
             sample_td = sample_td.to(self.device, non_blocking=True)
         # The initial ones are used only to extract the latent vector
         initial = (sample_td["stoch"][:, 0], sample_td["deter"][:, 0])
+        if self.requires_action_history:
+            if "incoming_action" not in sample_td.keys():
+                raise ValueError("Observation-aligned SRU replay requires stored incoming_action; legacy replay cannot supply it")
+            initial = (*initial, sample_td["incoming_action"][:, 0])
         data = sample_td[:, 1:]
         data.set_("action", sample_td["action"][:, :-1].clone())  # action is 1 step back
         index = [ind.view(-1, self.batch_length + 1)[:, 1:] for ind in info["index"]]

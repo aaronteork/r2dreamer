@@ -18,6 +18,7 @@ batch_size: 16
 batch_length: 64
 
 buffer:
+  recurrent: ${model.rssm.recurrent}
   batch_size: ${batch_size}
   batch_length: ${batch_length}
   max_size: 3e6
