@@ -17,6 +17,12 @@ from optim import LaProp, clip_grad_agc_
 from tools import to_f32
 
 
+def _mask_reset_actions(action, is_first):
+    """Zero incoming actions for resets; accept flags shaped (...,) or (..., 1)."""
+    reset = is_first.reshape(*action.shape[:-1], 1)
+    return torch.where(reset, torch.zeros_like(action), action)
+
+
 def _mask_invalid_imagination_starts(weight, is_last):
     """Zero rollout weights whose replay start is an episode boundary."""
     valid_start = (1.0 - to_f32(is_last)).reshape(weight.shape[0], 1, 1)
@@ -457,9 +463,8 @@ class Dreamer(nn.Module):
             init_stoch,
             init_deter,
             data["action"][:B, 5:],
-            **({"preceding_action": torch.where(
-                data["is_first"][:B, 4, None], torch.zeros_like(data["action"][:B, 4]),
-                data["action"][:B, 4],
+            **({"preceding_action": _mask_reset_actions(
+                data["action"][:B, 4], data["is_first"][:B, 4],
             )} if self.rssm.requires_action_history else {}),
         )
         openl = self.decoder(prior_stoch, prior_deter)["image"].mode()
@@ -743,8 +748,7 @@ class Dreamer(nn.Module):
             post_deter.reshape(-1, *post_deter.shape[2:]).detach(),
         )
         if self.rssm.requires_action_history:
-            incoming_action = torch.where(data["is_first"].unsqueeze(-1),
-                                          torch.zeros_like(data["action"]), data["action"])
+            incoming_action = _mask_reset_actions(data["action"], data["is_first"])
             start = (*start, incoming_action.reshape(-1, self.act_dim).detach())
         # (B, T, ...) -> (B*T, ...)
         imag_feat, imag_action = self._imagine(start, self.imag_horizon + 1)
