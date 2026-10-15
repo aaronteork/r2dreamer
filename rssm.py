@@ -119,6 +119,53 @@ class SRUDeter(Deter):
         return update * cand + (1 - update) * deter
 
 
+class SRUDecodeDeter(SRUDeter):
+    """SRU candidate conditioned on detached, reconstructed sensory inputs.
+
+    Decoder and camera CNN are supplied by Dreamer at each call; they are not
+    registered here, copied, or added to the RSSM optimizer/checkpoint tree.
+    """
+
+    def __init__(self, deter, stoch, act_dim, hidden, blocks, dynlayers, act="SiLU",
+                 spatial_modulation=True, proprio_dim=26, visual_dim=1024):
+        super().__init__(deter, stoch, act_dim, hidden, blocks, dynlayers, act, spatial_modulation)
+        self.proprio_dim = int(proprio_dim)
+        self.visual_dim = int(visual_dim)
+        if self.spatial_modulation:
+            self._spatial_transform = nn.Linear(self.visual_dim + self.proprio_dim + act_dim, deter, bias=True)
+            self.reset_spatial_parameters()
+
+    def forward(self, stoch, deter, action, preceding_action=None, *, sensory_modules=None):
+        if preceding_action is None:
+            raise ValueError("sru_decode requires the stochastic state's incoming action")
+        x0, x1, x2 = self._project_inputs(stoch, deter, action)
+        reset, cand, update = self._gate_preactivations(deter, x0, x1, x2)
+        if self.spatial_modulation:
+            if sensory_modules is None:
+                raise ValueError("sru_decode requires Dreamer's decoder and camera CNN")
+            decoder, camera_cnn = sensory_modules
+            # FP32 isolates this no-grad use from AMP's cached parameter casts.
+            # The ordinary reconstruction/encoding passes must still get grads.
+            with torch.no_grad(), torch.autocast(device_type=stoch.device.type, enabled=False):
+                decoded = decoder(stoch.float(), deter.float())
+                image = decoded["image"].mode()
+                proprio = decoded["proprioception"].mode()
+                # Decoder pixels already use Dreamer's normalized image scale.
+                # Do not quantize or divide by 255 a second time.
+                visual = camera_cnn(image)
+            if visual.shape[-1] != self.visual_dim or proprio.shape[-1] != self.proprio_dim:
+                raise ValueError("sru_decode sensory dimensions do not match decoder/CNN outputs")
+            preceding_action = preceding_action / torch.clip(torch.abs(preceding_action), min=1.0).detach()
+            spatial = self._spatial_transform(torch.cat([visual, proprio, preceding_action], dim=-1))
+            self._last_spatial = spatial.detach()
+            cand = spatial * cand
+        else:
+            self._last_spatial = None
+        cand = torch.tanh(torch.sigmoid(reset) * cand)
+        update = torch.sigmoid(update - 1)
+        return update * cand + (1 - update) * deter
+
+
 class MotionSRUDeter(Deter):
     """Block-GRU whose candidate is modulated by predicted ego-motion.
 
@@ -298,7 +345,7 @@ class ActionVisualSRUDeter(Deter):
 
 
 class RSSM(nn.Module):
-    def __init__(self, config, embed_size, act_dim, visual_dim=1024):
+    def __init__(self, config, embed_size, act_dim, visual_dim=1024, proprio_dim=26):
         super().__init__()
         self._stoch = int(config.stoch)
         self._deter = int(config.deter)
@@ -314,7 +361,8 @@ class RSSM(nn.Module):
         self._dyn_layers = int(config.dyn_layers)
         self._blocks = int(config.blocks)
         self._recurrent = str(getattr(config, "recurrent", "gru"))
-        self.requires_action_history = self._recurrent == "sru"
+        self.requires_action_history = self._recurrent in {"sru", "sru_decode"}
+        self.requires_sensory_decode = self._recurrent == "sru_decode"
         self._use_motion_sru = bool(getattr(config, "use_motion_sru", False))
         self._use_visual_spatial = bool(
             getattr(config, "use_visual_spatial", False)
@@ -322,6 +370,7 @@ class RSSM(nn.Module):
         recurrent_cores = {
             "gru": Deter,
             "sru": SRUDeter,
+            "sru_decode": SRUDecodeDeter,
             "action_visual_sru": ActionVisualSRUDeter,
         }
         if self._recurrent not in recurrent_cores:
@@ -352,8 +401,11 @@ class RSSM(nn.Module):
             dynlayers=self._dyn_layers,
             act=config.act,
         )
-        if self._recurrent == "sru":
+        if self.requires_action_history:
             kwargs["spatial_modulation"] = getattr(config, "spatial_modulation", True)
+        if self.requires_sensory_decode:
+            kwargs["proprio_dim"] = int(proprio_dim)
+            kwargs["visual_dim"] = int(visual_dim)
         if self._use_visual_spatial or self._recurrent == "action_visual_sru":
             kwargs["visual_dim"] = int(visual_dim)
         if self._use_visual_spatial:
@@ -421,7 +473,7 @@ class RSSM(nn.Module):
             return stoch, deter, incoming_action
         return stoch, deter
 
-    def observe(self, embed, action, initial, reset):
+    def observe(self, embed, action, initial, reset, *, sensory_modules=None):
         """Posterior rollout: action[:, t] is a_{t-1}, not outgoing a_t.
 
         Aligned initial state is (z_{k-1}, h_{k-1}, a_{k-2}). Subsequent
@@ -449,7 +501,8 @@ class RSSM(nn.Module):
             # (B, S, K), (B, D), (B, S, K)
             if self.requires_action_history:
                 stoch, deter, logit, incoming_action = self.obs_step(
-                    stoch, deter, action[:, i], embed[:, i], reset[:, i], preceding_action=incoming_action
+                    stoch, deter, action[:, i], embed[:, i], reset[:, i], preceding_action=incoming_action,
+                    sensory_modules=sensory_modules,
                 )
             else:
                 stoch, deter, logit = self.obs_step(stoch, deter, action[:, i], embed[:, i], reset[:, i])
@@ -477,7 +530,7 @@ class RSSM(nn.Module):
         self._last_spatial_terms = torch.stack(spatial_terms, dim=1) if track_spatial else None
         return stochs, deters, logits
 
-    def obs_step(self, stoch, deter, prev_action, embed, reset, visual_features=None, *, preceding_action=None):
+    def obs_step(self, stoch, deter, prev_action, embed, reset, visual_features=None, *, preceding_action=None, sensory_modules=None):
         """Construct (z_t, h_t) from z_{t-1}, h_{t-1}, a_{t-1}.
 
         Aligned mode additionally takes a_{t-2} and returns the masked
@@ -499,7 +552,11 @@ class RSSM(nn.Module):
                 raise ValueError("Observation-aligned SRU does not accept observed visual features")
             preceding_action = torch.where(rpad(reset, preceding_action.dim() - reset.dim()),
                                           torch.zeros_like(preceding_action), preceding_action)
-            deter = self._deter_net(stoch, deter, prev_action, preceding_action=preceding_action)
+            if self.requires_sensory_decode:
+                deter = self._deter_net(stoch, deter, prev_action, preceding_action=preceding_action,
+                                       sensory_modules=sensory_modules)
+            else:
+                deter = self._deter_net(stoch, deter, prev_action, preceding_action=preceding_action)
         elif visual_features is None:
             deter = self._deter_net(stoch, deter, prev_action)
         else:
@@ -518,14 +575,18 @@ class RSSM(nn.Module):
             return stoch, deter, logit, prev_action
         return stoch, deter, logit
 
-    def img_step(self, stoch, deter, prev_action, *, preceding_action=None):
+    def img_step(self, stoch, deter, prev_action, *, preceding_action=None, sensory_modules=None):
         """Prior transition; aligned mode returns incoming action as result 3."""
 
         # (B, D)
         if self.requires_action_history:
             if preceding_action is None:
                 raise ValueError("Observation-aligned SRU requires incoming_action in prior state")
-            deter = self._deter_net(stoch, deter, prev_action, preceding_action=preceding_action)
+            if self.requires_sensory_decode:
+                deter = self._deter_net(stoch, deter, prev_action, preceding_action=preceding_action,
+                                       sensory_modules=sensory_modules)
+            else:
+                deter = self._deter_net(stoch, deter, prev_action, preceding_action=preceding_action)
         else:
             deter = self._deter_net(stoch, deter, prev_action)
         # (B, S, K)
@@ -542,7 +603,7 @@ class RSSM(nn.Module):
         stoch = self.get_dist(logit).rsample()
         return stoch, logit
 
-    def imagine_with_action(self, stoch, deter, actions, *, preceding_action=None):
+    def imagine_with_action(self, stoch, deter, actions, *, preceding_action=None, sensory_modules=None):
         """Roll out prior dynamics given a sequence of actions."""
         # (B, S, K), (B, D), (B, T, A)
         L = actions.shape[1]
@@ -550,7 +611,7 @@ class RSSM(nn.Module):
         for i in range(L):
             if self.requires_action_history:
                 stoch, deter, preceding_action = self.img_step(
-                    stoch, deter, actions[:, i], preceding_action=preceding_action
+                    stoch, deter, actions[:, i], preceding_action=preceding_action, sensory_modules=sensory_modules,
                 )
             else:
                 stoch, deter = self.img_step(stoch, deter, actions[:, i])

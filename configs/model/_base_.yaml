@@ -77,9 +77,11 @@ dreamer_pro:
     bilinear: True
 
 rssm:
-  recurrent: 'gru' # gru/sru/action_visual_sru
+  recurrent: 'gru' # gru/sru/sru_decode/action_visual_sru
   # sru: linear [z_{t-1}, a_{t-2}] candidate multiplier,
   # with a_{t-1} retained for dynamics. No predictor or auxiliary loss.
+  # sru_decode requires model.rep_loss=dreamer and image/proprioception decoder
+  # heads. It reuses the decoder and camera CNN under no_grad for modulation.
   # action_visual_sru requires both legacy flags below to remain false.
   use_motion_sru: ${model.use_motion_sru}
   use_visual_spatial: ${model.use_visual_spatial}

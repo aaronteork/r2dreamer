@@ -108,6 +108,8 @@ class Dreamer(nn.Module):
         self.return_ema = networks.ReturnEMA(device=self.device)
         self.act_dim = act_space.n if hasattr(act_space, "n") else sum(act_space.shape)
         self.rep_loss = str(config.rep_loss)
+        if str(getattr(config.rssm, "recurrent", "gru")) == "sru_decode" and self.rep_loss != "dreamer":
+            raise ValueError("sru_decode requires model.rep_loss=dreamer to train the shared sensory decoder")
         self.fixed_continuation = bool(getattr(config, "fixed_continuation", False))
         self.motion_loss_scale = float(getattr(config, "motion_loss_scale", 1.0))
         self.use_motion_sru = bool(
@@ -140,6 +142,9 @@ class Dreamer(nn.Module):
         shapes = {k: tuple(v.shape) for k, v in obs_space.spaces.items()}
         self.encoder = networks.MultiEncoder(config.encoder, shapes)
         self.embed_size = self.encoder.out_dim
+        if str(getattr(config.rssm, "recurrent", "gru")) == "sru_decode":
+            if tuple(self.encoder.cnn_shapes) != ("image",) or len(shapes.get("proprioception", ())) != 1:
+                raise ValueError("sru_decode requires a camera CNN for 'image' and vector 'proprioception'")
         if self.use_visual_spatial:
             if tuple(self.encoder.cnn_shapes) != ("image",):
                 raise ValueError(
@@ -156,6 +161,8 @@ class Dreamer(nn.Module):
             self.embed_size,
             self.act_dim,
             visual_dim=self.encoder.cnn_out_dim or 1024,
+            **({"proprio_dim": shapes["proprioception"][0]}
+               if str(getattr(config.rssm, "recurrent", "gru")) == "sru_decode" else {}),
         )
         self.reward = networks.MLPHead(config.reward, self.rssm.feat_size)
         self.cont = networks.MLPHead(config.cont, self.rssm.feat_size)
@@ -201,6 +208,10 @@ class Dreamer(nn.Module):
                 self.rssm.flat_stoch,
                 shapes,
             )
+            if self.rssm.requires_sensory_decode and (
+                tuple(self.decoder.cnn_shapes) != ("image",) or "proprioception" not in self.decoder.mlp_shapes
+            ):
+                raise ValueError("sru_decode requires image and proprioception reconstruction heads")
             # ``recon`` is the default for every observation decoder head. An
             # explicitly configured observation key takes precedence, allowing
             # heterogeneous targets (for example, pixels and proprioception) to
@@ -314,6 +325,13 @@ class Dreamer(nn.Module):
         self._slow_value.train(False)
         return self
 
+    def _sru_decode_modules(self, frozen=False):
+        """Borrow existing networks without registering them under the RSSM."""
+        if not self.rssm.requires_sensory_decode:
+            return None
+        encoder = self._frozen_encoder if frozen else self.encoder
+        return self.decoder, encoder.encoders[encoder.cnn_encoder_index]
+
     def clone_and_freeze(self):
         # NOTE: "requires_grad" affects whether a parameter is updated
         # not whether gradients flow through its operations
@@ -408,6 +426,7 @@ class Dreamer(nn.Module):
             stoch, deter, _, incoming_action = self._frozen_rssm.obs_step(
                 prev_stoch, prev_deter, prev_action, embed, obs["is_first"],
                 preceding_action=state["incoming_action"],
+                sensory_modules=self._sru_decode_modules(frozen=True),
             )
         elif visual_features is None:
             stoch, deter, _ = self._frozen_rssm.obs_step(prev_stoch, prev_deter, prev_action, embed, obs["is_first"])
@@ -456,6 +475,7 @@ class Dreamer(nn.Module):
             data["action"][:B, :5],
             tuple(val[:B] for val in initial),
             data["is_first"][:B, :5],
+            sensory_modules=self._sru_decode_modules(),
         )
         recon = self.decoder(post_stoch, post_deter)["image"].mode()[:B]
         init_stoch, init_deter = post_stoch[:, -1], post_deter[:, -1]
@@ -463,6 +483,7 @@ class Dreamer(nn.Module):
             init_stoch,
             init_deter,
             data["action"][:B, 5:],
+            sensory_modules=self._sru_decode_modules(),
             **({"preceding_action": _mask_reset_actions(
                 data["action"][:B, 4], data["is_first"][:B, 4],
             )} if self.rssm.requires_action_history else {}),
@@ -560,7 +581,9 @@ class Dreamer(nn.Module):
             embed = self.encoder(data)
             visual_target = None
         # (B, T, S, K), (B, T, D), (B, T, S, K)
-        post_stoch, post_deter, post_logit = self.rssm.observe(embed, data["action"], initial, data["is_first"])
+        post_stoch, post_deter, post_logit = self.rssm.observe(
+            embed, data["action"], initial, data["is_first"], sensory_modules=self._sru_decode_modules()
+        )
         # (B, T, S, K)
         _, prior_logit = self.rssm.prior(post_deter)
         dyn_loss, rep_loss = self.rssm.kl_loss(post_logit, prior_logit, self.kl_free)
@@ -890,7 +913,8 @@ class Dreamer(nn.Module):
             actions.append(action)
             if self.rssm.requires_action_history:
                 stoch, deter, incoming_action = self._frozen_rssm.img_step(
-                    stoch, deter, action, preceding_action=incoming_action
+                    stoch, deter, action, preceding_action=incoming_action,
+                    sensory_modules=self._sru_decode_modules(frozen=True),
                 )
             else:
                 stoch, deter = self._frozen_rssm.img_step(stoch, deter, action)

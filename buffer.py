@@ -11,7 +11,7 @@ class Buffer:
         self.batch_size = int(config.batch_size)
         self.batch_length = int(config.batch_length)
         self.num_eps = 0
-        self.requires_action_history = getattr(config, "recurrent", "gru") == "sru"
+        self.requires_action_history = getattr(config, "recurrent", "gru") in {"sru", "sru_decode"}
         self._buffer = ReplayBuffer(
             storage=LazyTensorStorage(max_size=config.max_size, device=self.storage_device, ndim=2),
             sampler=SliceSampler(

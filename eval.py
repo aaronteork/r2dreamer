@@ -895,6 +895,7 @@ def evaluate_imagination(
             set_torch_seed(latent_seed + 10_000_000)
             actual_stoch, actual_deter = agent._frozen_rssm.imagine_with_action(
                 *anchor[:2], actions,
+                sensory_modules=agent._sru_decode_modules(frozen=True),
                 **({"preceding_action": anchor[2]} if agent.rssm.requires_action_history else {}),
             )
             actual_action_prediction = (
@@ -914,7 +915,8 @@ def evaluate_imagination(
                 imagined_action = agent._frozen_actor(feat).rsample()
                 if agent.rssm.requires_action_history:
                     stoch, deter, incoming_action = agent._frozen_rssm.img_step(
-                        stoch, deter, imagined_action, preceding_action=incoming_action
+                        stoch, deter, imagined_action, preceding_action=incoming_action,
+                        sensory_modules=agent._sru_decode_modules(frozen=True),
                     )
                 else:
                     stoch, deter = agent._frozen_rssm.img_step(stoch, deter, imagined_action)
