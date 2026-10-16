@@ -92,11 +92,16 @@ def _masked_visual_mse(prediction, target, is_first, *, feature_reduction="mean"
     return (squared_error * valid).sum() / valid.sum().clamp_min(1.0)
 
 
-def _sensory_reconstruction_mse(prediction, target):
+def _sensory_reconstruction_mse(prediction, target, *, feature_reduction="mean"):
     """Same-time posterior readout; reset observations are valid targets too."""
     if prediction.shape != target.shape:
         raise ValueError(f"Sensory prediction/target shapes differ: {prediction.shape} vs {target.shape}")
-    return F.mse_loss(to_f32(prediction), to_f32(target.detach()))
+    squared_error = (to_f32(prediction) - to_f32(target.detach())).square()
+    if feature_reduction == "sum":
+        return squared_error.sum(dim=-1).mean()
+    if feature_reduction == "mean":
+        return squared_error.mean()
+    raise ValueError(f"Unknown sensory feature reduction: {feature_reduction!r}")
 
 
 class Dreamer(nn.Module):
@@ -609,9 +614,11 @@ class Dreamer(nn.Module):
             aux_visual, aux_proprio = self.rssm.predict_sensory(
                 post_stoch, post_deter, _mask_reset_actions(data["action"], data["is_first"])
             )
-            losses["sru_aux_visual"] = _sensory_reconstruction_mse(aux_visual, visual_target)
+            losses["sru_aux_visual"] = _sensory_reconstruction_mse(
+                aux_visual, visual_target, feature_reduction="sum"
+            )
             losses["sru_aux_proprio"] = _sensory_reconstruction_mse(aux_proprio, data["proprioception"])
-            metrics["sru_aux_visual_mse"] = losses["sru_aux_visual"].detach()
+            metrics["sru_aux_visual_mse"] = losses["sru_aux_visual"].detach() / aux_visual.shape[-1]
             metrics["sru_aux_proprio_mse"] = losses["sru_aux_proprio"].detach()
         if self.rssm.last_motion_preds is not None:
             if "ego_motion" not in data:

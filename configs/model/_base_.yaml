@@ -57,7 +57,7 @@ loss_scales:
   swav: 1.0
   temp: 1.0
   norm: 1.0
-  # sru_aux only: separate per-feature mean MSE coefficients.
+  # sru_aux only: visual feature-sum MSE; proprio feature-mean MSE.
   sru_aux_visual: 1.0
   sru_aux_proprio: 1.0
 
