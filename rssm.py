@@ -144,14 +144,9 @@ class SRUDecodeDeter(SRUDeter):
             if sensory_modules is None:
                 raise ValueError("sru_decode requires Dreamer's decoder and camera CNN")
             decoder, camera_cnn = sensory_modules
-            # Follow the caller's AMP precision and reuse cached weight casts.
-            # Requires the no-grad cache fix shipped in upstream PyTorch 2.11.
-            with torch.no_grad(), torch.autocast(
-                device_type=stoch.device.type,
-                enabled=torch.is_autocast_enabled(stoch.device.type),
-                dtype=torch.get_autocast_dtype(stoch.device.type),
-                cache_enabled=True,
-            ):
+            # FP32 isolates this no-grad use from AMP's cached parameter casts.
+            # The ordinary reconstruction/encoding passes must still get grads.
+            with torch.no_grad(), torch.autocast(device_type=stoch.device.type, enabled=False):
                 decoded = decoder(stoch.float(), deter.float())
                 image = decoded["image"].mode()
                 proprio = decoded["proprioception"].mode()
