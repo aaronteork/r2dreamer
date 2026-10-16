@@ -146,7 +146,12 @@ class SRUDecodeDeter(SRUDeter):
             decoder, camera_cnn = sensory_modules
             # FP32 isolates this no-grad use from AMP's cached parameter casts.
             # The ordinary reconstruction/encoding passes must still get grads.
-            with torch.no_grad(), torch.autocast(device_type=stoch.device.type, enabled=False):
+            with torch.no_grad(), torch.autocast(
+                device_type=stoch.device.type,
+                enabled=torch.is_autocast_enabled(stoch.device.type),
+                dtype=torch.get_autocast_dtype(stoch.device.type),
+                cache_enabled=True,
+            ):
                 decoded = decoder(stoch.float(), deter.float())
                 image = decoded["image"].mode()
                 proprio = decoded["proprioception"].mode()
