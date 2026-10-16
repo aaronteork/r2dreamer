@@ -144,9 +144,14 @@ class SRUDecodeDeter(SRUDeter):
             if sensory_modules is None:
                 raise ValueError("sru_decode requires Dreamer's decoder and camera CNN")
             decoder, camera_cnn = sensory_modules
-            # FP32 isolates this no-grad use from AMP's cached parameter casts.
-            # The ordinary reconstruction/encoding passes must still get grads.
-            with torch.no_grad(), torch.autocast(device_type=stoch.device.type, enabled=False):
+            # Follow the caller's AMP precision and reuse cached weight casts.
+            # Requires the no-grad cache fix shipped in upstream PyTorch 2.11.
+            with torch.no_grad(), torch.autocast(
+                device_type=stoch.device.type,
+                enabled=torch.is_autocast_enabled(stoch.device.type),
+                dtype=torch.get_autocast_dtype(stoch.device.type),
+                cache_enabled=True,
+            ):
                 decoded = decoder(stoch.float(), deter.float())
                 image = decoded["image"].mode()
                 proprio = decoded["proprioception"].mode()
@@ -157,6 +162,67 @@ class SRUDecodeDeter(SRUDeter):
                 raise ValueError("sru_decode sensory dimensions do not match decoder/CNN outputs")
             preceding_action = preceding_action / torch.clip(torch.abs(preceding_action), min=1.0).detach()
             spatial = self._spatial_transform(torch.cat([visual, proprio, preceding_action], dim=-1))
+            self._last_spatial = spatial.detach()
+            cand = spatial * cand
+        else:
+            self._last_spatial = None
+        cand = torch.tanh(torch.sigmoid(reset) * cand)
+        update = torch.sigmoid(update - 1)
+        return update * cand + (1 - update) * deter
+
+
+class SRUAuxDeter(SRUDeter):
+    """Current-state sensory reconstruction with detached candidate conditioning.
+
+    The extractor receives the input state's incoming action, not the forward
+    dynamics action. Auxiliary supervision trains shared state/action projections.
+    Recurrent losses train the spatial affine map, but cannot reach the
+    extractor through its detached visual/proprioceptive outputs.
+    """
+
+    def __init__(self, deter, stoch, act_dim, hidden, blocks, dynlayers, act="SiLU",
+                 spatial_modulation=True, proprio_dim=26, visual_dim=1024):
+        super().__init__(deter, stoch, act_dim, hidden, blocks, dynlayers, act, spatial_modulation)
+        self.proprio_dim = int(proprio_dim)
+        self.visual_dim = int(visual_dim)
+        act_fn = getattr(nn, act)
+        self._sensory_extractor = nn.Sequential(
+            nn.Linear(3 * self.hidden, self.hidden),
+            nn.RMSNorm(self.hidden, eps=1e-04, dtype=torch.float32), act_fn(),
+            nn.Linear(self.hidden, self.hidden),
+            nn.RMSNorm(self.hidden, eps=1e-04, dtype=torch.float32), act_fn(),
+            nn.Linear(self.hidden, self.hidden),
+            nn.RMSNorm(self.hidden, eps=1e-04, dtype=torch.float32), act_fn(),
+            nn.Linear(self.hidden, self.visual_dim + self.proprio_dim),
+        )
+        if self.spatial_modulation:
+            self._spatial_transform = nn.Linear(self.visual_dim + self.proprio_dim + act_dim, deter)
+            self.reset_spatial_parameters()
+
+    def _sensory_predictions(self, x0, x1, incoming_action):
+        incoming_action = incoming_action / torch.clip(torch.abs(incoming_action), min=1.0).detach()
+        incoming = self._dyn_in2(incoming_action)
+        predictions = self._sensory_extractor(torch.cat([x0, x1, incoming], dim=-1))
+        return predictions.split([self.visual_dim, self.proprio_dim], dim=-1)
+
+    def predict_sensory(self, stoch, deter, incoming_action):
+        """Read out state t using its incoming a_{t-1}, including B,T batches."""
+        if incoming_action.shape != (*deter.shape[:-1], self.act_dim):
+            raise ValueError("Sensory readout requires the input state's incoming action")
+        stoch = stoch.reshape(*deter.shape[:-1], -1)
+        return self._sensory_predictions(self._dyn_in0(deter), self._dyn_in1(stoch), incoming_action)
+
+    def forward(self, stoch, deter, action, preceding_action=None):
+        if preceding_action is None:
+            raise ValueError("Observation-aligned SRU requires the stochastic state's incoming action")
+        x0, x1, x2 = self._project_inputs(stoch, deter, action)
+        reset, cand, update = self._gate_preactivations(deter, x0, x1, x2)
+        if self.spatial_modulation:
+            visual, proprio = self._sensory_predictions(x0, x1, preceding_action)
+            preceding_action = preceding_action / torch.clip(torch.abs(preceding_action), min=1.0).detach()
+            spatial = self._spatial_transform(
+                torch.cat([visual.detach(), proprio.detach(), preceding_action], dim=-1)
+            )
             self._last_spatial = spatial.detach()
             cand = spatial * cand
         else:
@@ -361,8 +427,9 @@ class RSSM(nn.Module):
         self._dyn_layers = int(config.dyn_layers)
         self._blocks = int(config.blocks)
         self._recurrent = str(getattr(config, "recurrent", "gru"))
-        self.requires_action_history = self._recurrent in {"sru", "sru_decode"}
+        self.requires_action_history = self._recurrent in {"sru", "sru_decode", "sru_aux"}
         self.requires_sensory_decode = self._recurrent == "sru_decode"
+        self.requires_sensory_aux = self._recurrent == "sru_aux"
         self._use_motion_sru = bool(getattr(config, "use_motion_sru", False))
         self._use_visual_spatial = bool(
             getattr(config, "use_visual_spatial", False)
@@ -371,6 +438,7 @@ class RSSM(nn.Module):
             "gru": Deter,
             "sru": SRUDeter,
             "sru_decode": SRUDecodeDeter,
+            "sru_aux": SRUAuxDeter,
             "action_visual_sru": ActionVisualSRUDeter,
         }
         if self._recurrent not in recurrent_cores:
@@ -403,7 +471,7 @@ class RSSM(nn.Module):
         )
         if self.requires_action_history:
             kwargs["spatial_modulation"] = getattr(config, "spatial_modulation", True)
-        if self.requires_sensory_decode:
+        if self.requires_sensory_decode or self.requires_sensory_aux:
             kwargs["proprio_dim"] = int(proprio_dim)
             kwargs["visual_dim"] = int(visual_dim)
         if self._use_visual_spatial or self._recurrent == "action_visual_sru":
@@ -451,6 +519,11 @@ class RSSM(nn.Module):
     @property
     def last_spatial_terms(self):
         return self._last_spatial_terms
+
+    def predict_sensory(self, stoch, deter, incoming_action):
+        if not self.requires_sensory_aux:
+            raise ValueError("Sensory auxiliary reconstruction requires recurrent='sru_aux'")
+        return self._deter_net.predict_sensory(stoch, deter, incoming_action)
 
     @property
     def last_motion_preds(self):

@@ -92,6 +92,13 @@ def _masked_visual_mse(prediction, target, is_first, *, feature_reduction="mean"
     return (squared_error * valid).sum() / valid.sum().clamp_min(1.0)
 
 
+def _sensory_reconstruction_mse(prediction, target):
+    """Same-time posterior readout; reset observations are valid targets too."""
+    if prediction.shape != target.shape:
+        raise ValueError(f"Sensory prediction/target shapes differ: {prediction.shape} vs {target.shape}")
+    return F.mse_loss(to_f32(prediction), to_f32(target.detach()))
+
+
 class Dreamer(nn.Module):
     def __init__(self, config, obs_space, act_space):
         super().__init__()
@@ -137,14 +144,15 @@ class Dreamer(nn.Module):
             str(getattr(config.rssm, "recurrent", "gru")) == "action_visual_sru"
         )
         self.use_visual_spatial = self.use_visual_spatial or self.use_action_visual_sru
+        self.use_sru_aux = str(getattr(config.rssm, "recurrent", "gru")) == "sru_aux"
 
         # World model components
         shapes = {k: tuple(v.shape) for k, v in obs_space.spaces.items()}
         self.encoder = networks.MultiEncoder(config.encoder, shapes)
         self.embed_size = self.encoder.out_dim
-        if str(getattr(config.rssm, "recurrent", "gru")) == "sru_decode":
+        if str(getattr(config.rssm, "recurrent", "gru")) in {"sru_decode", "sru_aux"}:
             if tuple(self.encoder.cnn_shapes) != ("image",) or len(shapes.get("proprioception", ())) != 1:
-                raise ValueError("sru_decode requires a camera CNN for 'image' and vector 'proprioception'")
+                raise ValueError("Sensory SRU requires a camera CNN for 'image' and vector 'proprioception'")
         if self.use_visual_spatial:
             if tuple(self.encoder.cnn_shapes) != ("image",):
                 raise ValueError(
@@ -162,7 +170,7 @@ class Dreamer(nn.Module):
             self.act_dim,
             visual_dim=self.encoder.cnn_out_dim or 1024,
             **({"proprio_dim": shapes["proprioception"][0]}
-               if str(getattr(config.rssm, "recurrent", "gru")) == "sru_decode" else {}),
+               if str(getattr(config.rssm, "recurrent", "gru")) in {"sru_decode", "sru_aux"} else {}),
         )
         self.reward = networks.MLPHead(config.reward, self.rssm.feat_size)
         self.cont = networks.MLPHead(config.cont, self.rssm.feat_size)
@@ -189,6 +197,9 @@ class Dreamer(nn.Module):
         self._slow_value_updates = 0
 
         self._loss_scales = dict(config.loss_scales)
+        if self.use_sru_aux:
+            self._loss_scales.setdefault("sru_aux_visual", 1.0)
+            self._loss_scales.setdefault("sru_aux_proprio", 1.0)
         self._log_grads = bool(config.log_grads)
         self.reconstruction_log_scales = nn.ParameterDict()
 
@@ -573,7 +584,7 @@ class Dreamer(nn.Module):
 
         # === World model: posterior rollout and KL losses ===
         # (B, T, E)
-        if self.use_visual_spatial:
+        if self.use_visual_spatial or self.use_sru_aux:
             # Reuse the current online camera encoding. The detached CNN-only
             # tensor is a teacher target; it never enters the RSSM transition.
             embed, visual_target = self.encoder.forward_with_cnn(data)
@@ -589,6 +600,19 @@ class Dreamer(nn.Module):
         dyn_loss, rep_loss = self.rssm.kl_loss(post_logit, prior_logit, self.kl_free)
         losses["dyn"] = torch.mean(dyn_loss)
         losses["rep"] = torch.mean(rep_loss)
+        if self.use_sru_aux:
+            # Supervise R(h_t,z_t,a_{t-1}) with o_t; data["action"] is already
+            # shifted to incoming actions by replay. Reset rows use zero.
+            # The next recurrent transition uses
+            # that state's readout. No shifted targets or context-row sensors
+            # are needed, and reset posterior states have valid observations.
+            aux_visual, aux_proprio = self.rssm.predict_sensory(
+                post_stoch, post_deter, _mask_reset_actions(data["action"], data["is_first"])
+            )
+            losses["sru_aux_visual"] = _sensory_reconstruction_mse(aux_visual, visual_target)
+            losses["sru_aux_proprio"] = _sensory_reconstruction_mse(aux_proprio, data["proprioception"])
+            metrics["sru_aux_visual_mse"] = losses["sru_aux_visual"].detach()
+            metrics["sru_aux_proprio_mse"] = losses["sru_aux_proprio"].detach()
         if self.rssm.last_motion_preds is not None:
             if "ego_motion" not in data:
                 raise KeyError(
