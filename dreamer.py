@@ -617,9 +617,11 @@ class Dreamer(nn.Module):
             losses["sru_aux_visual"] = _sensory_reconstruction_mse(
                 aux_visual, visual_target, feature_reduction="sum"
             )
-            losses["sru_aux_proprio"] = _sensory_reconstruction_mse(aux_proprio, data["proprioception"])
+            losses["sru_aux_proprio"] = _sensory_reconstruction_mse(
+                aux_proprio, data["proprioception"], feature_reduction="sum"
+            )
             metrics["sru_aux_visual_mse"] = losses["sru_aux_visual"].detach() / aux_visual.shape[-1]
-            metrics["sru_aux_proprio_mse"] = losses["sru_aux_proprio"].detach()
+            metrics["sru_aux_proprio_mse"] = losses["sru_aux_proprio"].detach() / aux_proprio.shape[-1]
         if self.rssm.last_motion_preds is not None:
             if "ego_motion" not in data:
                 raise KeyError(
