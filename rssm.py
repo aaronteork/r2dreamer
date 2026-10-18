@@ -178,11 +178,17 @@ class SRUAuxDeter(SRUDeter):
     dynamics action. Auxiliary supervision trains shared state/action projections.
     Recurrent losses train the spatial affine map, but cannot reach the
     extractor through its detached visual/proprioceptive outputs.
+    The direct spatial action defaults to a_{t-2}; the optional forward-action
+    ablation uses a_{t-1} there while retaining a_{t-2} in the extractor.
     """
 
     def __init__(self, deter, stoch, act_dim, hidden, blocks, dynlayers, act="SiLU",
-                 spatial_modulation=True, proprio_dim=26, visual_dim=1024):
+                 spatial_modulation=True, proprio_dim=26, visual_dim=1024,
+                 spatial_action="preceding"):
         super().__init__(deter, stoch, act_dim, hidden, blocks, dynlayers, act, spatial_modulation)
+        if spatial_action not in {"preceding", "forward"}:
+            raise ValueError("sru_aux_spatial_action must be 'preceding' or 'forward'")
+        self.spatial_action = spatial_action
         self.proprio_dim = int(proprio_dim)
         self.visual_dim = int(visual_dim)
         act_fn = getattr(nn, act)
@@ -219,9 +225,12 @@ class SRUAuxDeter(SRUDeter):
         reset, cand, update = self._gate_preactivations(deter, x0, x1, x2)
         if self.spatial_modulation:
             visual, proprio = self._sensory_predictions(x0, x1, preceding_action)
-            preceding_action = preceding_action / torch.clip(torch.abs(preceding_action), min=1.0).detach()
+            # Only the direct spatial action changes in this ablation. The
+            # sensory readout always uses the state's incoming action above.
+            spatial_action = action if self.spatial_action == "forward" else preceding_action
+            spatial_action = spatial_action / torch.clip(torch.abs(spatial_action), min=1.0).detach()
             spatial = self._spatial_transform(
-                torch.cat([visual.detach(), proprio.detach(), preceding_action], dim=-1)
+                torch.cat([visual.detach(), proprio.detach(), spatial_action], dim=-1)
             )
             self._last_spatial = spatial.detach()
             cand = spatial * cand
@@ -474,6 +483,11 @@ class RSSM(nn.Module):
         if self.requires_sensory_decode or self.requires_sensory_aux:
             kwargs["proprio_dim"] = int(proprio_dim)
             kwargs["visual_dim"] = int(visual_dim)
+        aux_spatial_action = getattr(config, "sru_aux_spatial_action", "preceding")
+        if self.requires_sensory_aux:
+            kwargs["spatial_action"] = aux_spatial_action
+        elif aux_spatial_action != "preceding":
+            raise ValueError("sru_aux_spatial_action only applies to recurrent='sru_aux'")
         if self._use_visual_spatial or self._recurrent == "action_visual_sru":
             kwargs["visual_dim"] = int(visual_dim)
         if self._use_visual_spatial:

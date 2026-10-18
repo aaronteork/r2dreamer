@@ -93,6 +93,9 @@ rssm:
   use_motion_sru: ${model.use_motion_sru}
   use_visual_spatial: ${model.use_visual_spatial}
   spatial_modulation: true
+  # sru_aux only: direct action input to the spatial projection. The sensory
+  # predictor always retains a_{t-2}. Missing keys in old configs use preceding.
+  sru_aux_spatial_action: preceding  # preceding=a_{t-2}, forward=a_{t-1}
   stoch: 32
   deter: ${model.deter}
   hidden: ${model.hidden}
