@@ -114,7 +114,7 @@ class SRUDeter(Deter):
         x0, x1, x2 = self._project_inputs(stoch, deter, action)
         reset, cand, update = self._gate_preactivations(deter, x0, x1, x2)
         reset = torch.sigmoid(reset)
-        cand = self._candidate(reset, cand, stoch, preceding_action)
+        cand = self._candidate(reset, cand, stoch, preceding_action)  # Can also use action 
         update = torch.sigmoid(update - 1)
         return update * cand + (1 - update) * deter
 
