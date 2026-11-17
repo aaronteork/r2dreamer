@@ -23,6 +23,10 @@ Evaluate zero-shot landmark recall in the partitioned open field::
 
     python eval.py --task partition --run-dir logdir/homeostatic-ant
 
+Evaluate finite-resource foraging among held-out obstacles::
+
+    python eval.py --task obstacles --run-dir logdir/homeostatic-ant
+
 Use observed camera features for Action-Visual SRU evaluation only::
 
     python eval.py --task partition --run-dir logdir/homeostatic-ant \
@@ -41,7 +45,7 @@ import argparse
 import csv
 import datetime as dt
 import json
-from dataclasses import fields
+from dataclasses import asdict, fields
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -75,12 +79,17 @@ PARTITION_PATH_METRICS = (
     "second_leg_path_efficiency",
 )
 
+OBSTACLES_METRICS = (
+    "resources_collected", "num_food", "num_water", "collection_success",
+    "total_distance", "completion_steps", "completion_distance", "homeostatic_death",
+)
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Evaluate an R2Dreamer agent.")
     parser.add_argument(
         "--task",
-        choices=("forage", "imagine", "partition"),
+        choices=("forage", "imagine", "partition", "obstacles"),
         required=True,
         help="Evaluation task.",
     )
@@ -100,13 +109,13 @@ def parse_args() -> argparse.Namespace:
         "--episodes",
         type=int,
         default=None,
-        help="Number of episodes (default: 1 forage, 100 imagine, 100 partition).",
+        help="Number of episodes (default: 1 forage, 100 imagine/partition, 50 obstacles).",
     )
     parser.add_argument(
         "--max-steps",
         type=int,
         default=None,
-        help="Maximum steps per episode (default: EnvConfig.eval_max_steps).",
+        help="Maximum steps per episode (obstacles defaults to its natural death bound).",
     )
     parser.add_argument("--seed", type=int, default=0, help="First episode seed.")
     parser.add_argument(
@@ -126,7 +135,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--stochastic",
         action="store_true",
-        help="Sample policy actions instead of using the distribution mode.",
+        help="Sample policy actions; obstacles always samples, matching partition.",
     )
     parser.add_argument(
         "--sru-visual-source", choices=("predicted", "observed"), default="predicted",
@@ -155,6 +164,9 @@ def parse_args() -> argparse.Namespace:
         help="Number of future steps in each imagination rollout.",
     )
     args = parser.parse_args()
+    if args.task == "obstacles":
+        # Match partition's sampled actor actions and record the effective mode.
+        args.stochastic = True
 
     if not args.run_dir.is_dir():
         parser.error(f"Run directory not found: {args.run_dir}")
@@ -274,6 +286,24 @@ def make_partition_env(
         seed=seed,
         policy_size=policy_size,
     )
+
+
+def make_obstacles_env(config: Any, *, seed: int,
+                       render_size: tuple[int, int] | None = None) -> Any:
+    """Build the independent clutter task; never inherit training resource counts."""
+    from custom_env.config_obstacles import ObstaclesConfig
+    from custom_env.obstacles_env import ObstaclesEnv
+
+    policy_size = tuple(map(int, config.env.size))
+    valid_fields = {field.name for field in fields(ObstaclesConfig)}
+    task_fields = set(ObstaclesConfig.__annotations__)
+    configured = {key: value for key, value in dict(config.env).items()
+                  if key in valid_fields and key not in task_fields}
+    configured.update(seed=seed, device=torch.device(config.model.device),
+                      image_size=render_size or policy_size, is_training=False,
+                      num_heat=0, obs_space_dim=26, imagine=False, max_steps=float("inf"))
+    return R2DreamerEnvAdapter(ObstaclesEnv(ObstaclesConfig(**configured)),
+                              seed=seed, policy_size=policy_size)
 
 
 class R2DreamerEnvAdapter:
@@ -515,6 +545,9 @@ def episode_summary(
     for key in PARTITION_PATH_METRICS:
         if key in info:
             row[key] = scalar(info, key)
+    if "collection_success" in info:
+        for key in OBSTACLES_METRICS:
+            row[key] = scalar(info, key)
     return row
 
 
@@ -532,6 +565,19 @@ def evaluation_summary(
     task: str, max_steps: int, rows: list[dict[str, Any]]
 ) -> dict[str, Any]:
     """Create a compact task-level summary alongside per-episode results."""
+    if task == "obstacles":
+        result = dict(task=task, episodes=len(rows), max_steps=max_steps)
+        for key in ("food_consumed", "water_consumed", "resources_collected", "steps",
+                    "total_distance", "completion_steps", "completion_distance"):
+            values = np.asarray([row.get(key, float("nan")) for row in rows], dtype=float)
+            values = values[np.isfinite(values)]
+            result[f"mean_{key}"] = float(np.mean(values)) if values.size else float("nan")
+            result[f"std_{key}"] = float(np.std(values)) if values.size else float("nan")
+            result[f"count_{key}"] = int(values.size)
+        result["collection_success_rate"] = float(np.mean([row["collection_success"] for row in rows]))
+        for outcome in ("resources_collected", "homeostatic_termination", "evaluation_cutoff"):
+            result[f"{outcome}_episodes"] = sum(row["outcome"] == outcome for row in rows)
+        return result
     result = {
         "task": task,
         "episodes": len(rows),
@@ -1006,6 +1052,7 @@ def evaluate(
     stochastic: bool,
     recorder: VideoRecorder | None,
     sru_visual_source: str = "predicted",
+    layouts: list[dict[str, Any]] | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     step_rows: list[dict[str, Any]] = []
     episode_rows: list[dict[str, Any]] = []
@@ -1020,6 +1067,8 @@ def evaluate(
         seed = first_seed + episode
         latent_seed = first_seed + 1_000_000_000 + episode
         observation = env.reset(seed=seed, options=condition)
+        if task == "obstacles" and layouts is not None:
+            layouts.append({"episode": episode, **env._env.layout})
         set_torch_seed(latent_seed)
         state = agent.get_initial_state(1)
         total_reward = 0.0
@@ -1076,7 +1125,18 @@ def evaluate(
             if task == "partition":
                 for key in PARTITION_PATH_METRICS:
                     step_row[key] = scalar(info, key)
+            if task == "obstacles":
+                for key in OBSTACLES_METRICS:
+                    step_row[key] = scalar(info, key)
             step_rows.append(step_row)
+
+            if task == "obstacles":
+                if scalar(info, "homeostatic_death"):
+                    outcome = "homeostatic_termination"
+                    break
+                if scalar(info, "collection_success"):
+                    outcome = "resources_collected"
+                    break
 
             resources_collected = (
                 task in {"imagine", "partition"}
@@ -1142,6 +1202,9 @@ def make_task_env(
     config: Any,
     render_size: tuple[int, int] | None,
 ) -> tuple[Any, int]:
+    if args.task == "obstacles":
+        env = make_obstacles_env(config, seed=args.seed, render_size=render_size)
+        return env, env._env.cfg.natural_step_bound
     if args.task == "partition":
         env = make_partition_env(config, seed=args.seed, render_size=render_size)
         return env, int(env._env.cfg.max_steps)
@@ -1174,7 +1237,7 @@ def main() -> None:
             f"This evaluator supports homeoant_ant runs, not {config.env.task!r}."
         )
 
-    default_episodes = {"forage": 1, "imagine": 100, "partition": 100}
+    default_episodes = {"forage": 1, "imagine": 100, "partition": 100, "obstacles": 50}
     episodes = args.episodes or default_episodes[args.task]
     render_size = None if args.no_video else (args.video_size, args.video_size)
     run_dir = config_path.parent.parent
@@ -1189,6 +1252,8 @@ def main() -> None:
     set_seed_everywhere(args.seed)
     recorder = None
     prediction_rows: list[dict[str, Any]] = []
+    layouts: list[dict[str, Any]] = []
+    obstacles_config = asdict(env._env.cfg) if args.task == "obstacles" else None
     try:
         print(f"Evaluating checkpoint: {model_path.name}", flush=True)
         agent = load_agent(model_path, config, env, device)
@@ -1226,6 +1291,7 @@ def main() -> None:
                 stochastic=args.stochastic,
                 recorder=recorder,
                 sru_visual_source=args.sru_visual_source,
+                layouts=layouts,
             )
     finally:
         if recorder is not None:
@@ -1281,6 +1347,15 @@ def main() -> None:
         ),
         "policy_resolution": list(map(int, config.env.size)),
     }
+    if args.task == "obstacles":
+        layouts_path = output_dir / f"{stem}_layouts.json"
+        with layouts_path.open("w", encoding="utf-8") as file:
+            json.dump(layouts, file, indent=2)
+        obstacles_config["device"] = str(obstacles_config["device"])
+        obstacles_config["max_steps"] = None  # No environment time limit.
+        manifest["obstacles_config"] = obstacles_config
+        manifest["layouts_file"] = layouts_path.name
+        manifest["step_limit_source"] = "explicit_cutoff" if args.max_steps else "natural_death_bound"
     with manifest_path.open("w", encoding="utf-8") as file:
         json.dump(manifest, file, indent=2)
     print(f"Saved evaluation to {output_dir}")

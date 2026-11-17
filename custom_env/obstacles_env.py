@@ -1,0 +1,159 @@
+"""Held-out finite-resource foraging among unpadded physical obstacles."""
+
+import math
+import tempfile
+import xml.etree.ElementTree as ET
+from dataclasses import replace
+from pathlib import Path
+
+import mujoco
+import numpy as np
+
+from custom_env.ant_env import HomeostaticAntEnv, RESOURCE_MARKER_RADIUS
+from custom_env.config_obstacles import ObstaclesConfig
+from custom_env.ego_motion import compute_ego_motion
+from custom_env.obstacles_layout import generate_layout
+
+
+class ObstaclesEnv(HomeostaticAntEnv):
+    def __init__(self, cfg: ObstaclesConfig, **kwargs):
+        tree = ET.parse(Path(__file__).parent / cfg.xml_path)
+        worldbody = tree.find("worldbody")
+        if worldbody is None:
+            raise ValueError("Ant XML has no worldbody.")
+        # Mocap bodies allow per-reset obstacle poses without stale static BVHs.
+        # They have no action, observation, collision padding, or visible shells.
+        # Compile them inside the arena, then assign sampled poses before any
+        # simulation. Distant placeholders inflate model.stat.extent permanently:
+        # MuJoCo scales clipping, fog and shadows by that compiled extent.
+        for i in range(cfg.pillar_count + cfg.wall_count):
+            pillar = i < cfg.pillar_count
+            body = ET.SubElement(worldbody, "body", name=f"obstacle_{i}",
+                                 mocap="true", pos=f"0 0 {cfg.obstacle_height/2}")
+            size = (f"{cfg.pillar_diameter/2} {cfg.obstacle_height/2}" if pillar else
+                    f"{cfg.wall_length/2} {cfg.wall_thickness/2} {cfg.obstacle_height/2}")
+            ET.SubElement(body, "geom", name=f"obstacle_geom_{i}",
+                          type="cylinder" if pillar else "box", size=size,
+                          rgba="0.5 0.5 0.5 1", contype="1", conaffinity="1", group="2")
+        with tempfile.NamedTemporaryFile(suffix=".xml", delete=False) as file:
+            xml_path = Path(file.name)
+        tree.write(xml_path)
+        self._homeostatic_death = False
+        try:
+            super().__init__(replace(cfg, xml_path=str(xml_path)), **kwargs)
+        finally:
+            xml_path.unlink(missing_ok=True)
+        self.cfg = cfg
+        self.model.cam_fovy[self.pov_camera_id] = cfg.camera_fovy
+        self._obstacle_mocap_ids = [int(self.model.body_mocapid[
+            mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, f"obstacle_{i}")
+        ]) for i in range(cfg.pillar_count + cfg.wall_count)]
+        self.layout = None
+        self.total_distance = 0.
+        self._layout_seed = cfg.seed
+        # Group 2 is visible in the standard renderer; rays exclude ant/floor.
+        self._obstacle_ray_groups = np.array([0, 0, 1, 0, 0, 0], dtype=np.uint8)
+
+    def reset(self, *, seed=None, options=None):
+        if options:
+            raise ValueError("Obstacles does not use partition resource-order conditions.")
+        if seed is not None:
+            self._layout_seed = int(seed)
+        return super().reset(seed=seed)
+
+    def reset_model(self):
+        self.layout = generate_layout(self.cfg, self._layout_seed)
+        for mocap_id, o in zip(self._obstacle_mocap_ids, self.layout["obstacles"]):
+            self.data.mocap_pos[mocap_id] = [o["x"], o["y"], self.cfg.obstacle_height/2]
+            self.data.mocap_quat[mocap_id] = [math.cos(o["angle"]/2), 0, 0, math.sin(o["angle"]/2)]
+        qpos, qvel = self.init_qpos.copy(), self.init_qvel.copy()
+        qpos[:2] = [self.cfg.spawn_x, self.cfg.spawn_y]
+        qpos[3:7] = [math.cos(self.cfg.spawn_yaw/2), 0, 0, math.sin(self.cfg.spawn_yaw/2)]
+        self.set_state(qpos, qvel)
+        self._reset_ego_motion_tracking()
+        self.object = [tuple(r) for r in self.layout["resources"]]
+        self.hunger, self.thirst = self.cfg.initial_hunger, self.cfg.initial_thirst
+        self._initial_hunger, self._initial_thirst = self.hunger, self.thirst
+        self.temperature = 0.
+        self.current_step = self.food_consumed = self.water_consumed = 0
+        self.resources_consumed = []
+        self.heat_exposed_time = self.total_distance = 0.
+        self._homeostatic_death = False
+        self.posture = self._get_posture()
+        self.prev_drive = self._calculate_drive()
+        return self._get_obs()
+
+    def _resource_visible(self, resource):
+        _, x, y = resource
+        if not self._is_in_camera_fov(np.array([x, y])):
+            return False
+        origin = self.data.cam_xpos[self.pov_camera_id].copy()
+        target = np.array([x, y, RESOURCE_MARKER_RADIUS])
+        offset = target - origin
+        length = float(np.linalg.norm(offset))
+        if length < 1e-9:
+            return True
+        hit = np.array([-1], dtype=np.int32)
+        distance = mujoco.mj_ray(self.model, self.data, origin, offset/length,
+                                 self._obstacle_ray_groups, 1, -1, hit)
+        return distance < 0 or distance >= length
+
+    def step(self, action):
+        self.hunger -= self.cfg.hunger_decay
+        self.thirst -= self.cfg.thirst_decay
+        previous_position, previous_rotation = self._get_torso_pose()
+        self.do_simulation(action[:8], self.frame_skip)
+        position, rotation = self._get_torso_pose()
+        self._ego_motion = compute_ego_motion(previous_position, previous_rotation, position, rotation)
+        self._previous_torso_position, self._previous_torso_rotation = position, rotation
+        self.total_distance += float(np.linalg.norm(position[:2] - previous_position[:2]))
+        self.current_step += 1
+        self.posture = self._get_posture()
+        for resource in list(self.object):
+            if (np.linalg.norm(position[:2] - np.asarray(resource[1:])) < self.cfg.object_interaction_dist
+                    and self._resource_visible(resource)):
+                if resource[0] == "food":
+                    self.hunger += self.cfg.replenish_rate
+                    self.food_consumed += 1
+                else:
+                    self.thirst += self.cfg.replenish_rate
+                    self.water_consumed += 1
+                self.resources_consumed.append(resource[0])
+                self.object.remove(resource)
+        self._homeostatic_death = bool(abs(self.hunger) > .99999 or abs(self.thirst) > .99999)
+        success = not self.object and not self._homeostatic_death
+        current_drive = self._calculate_drive()
+        self.hunger, self.thirst = np.clip([self.hunger, self.thirst], -1., 1.)
+        action_magnitude = float(np.linalg.norm(action[:8]))
+        homeo_reward = self.cfg.reward_scale * (self.prev_drive - current_drive)
+        movement_penalty = -.5 * self.cfg.movement_penalty_weight * action_magnitude**2
+        posture_penalty = -self.cfg.posture_penalty_weight * self.posture**2
+        self.prev_drive = current_drive
+        reward = homeo_reward + movement_penalty + posture_penalty
+        info = dict(
+            timestep=self.current_step, hunger=self.hunger, thirst=self.thirst,
+            initial_hunger=self._initial_hunger, initial_thirst=self._initial_thirst,
+            food_consumed=self.food_consumed, water_consumed=self.water_consumed,
+            resources_collected=self.food_consumed + self.water_consumed,
+            num_food=self.cfg.num_food, num_water=self.cfg.num_water,
+            collection_success=int(success), total_distance=self.total_distance,
+            completion_steps=self.current_step if success else float("nan"),
+            completion_distance=self.total_distance if success else float("nan"),
+            homeostatic_death=int(self._homeostatic_death),
+            termination_reason=1 if self._homeostatic_death else 4 if success else 0,
+            posture=self.posture, z_pos=float(position[2]),
+            is_flipped=bool(self.data.xmat[self.ant_body_id][8] < 0),
+            action_magnitude=action_magnitude, reward_homeostatic=homeo_reward,
+            reward_movement_penalty=movement_penalty, reward_posture_penalty=posture_penalty,
+            ego_motion=self._ego_motion.copy(),
+        )
+        observation = self._get_obs()
+        if not self.cfg.is_training:
+            environment_rgb, _ = self.mux_render(camera_name="environment")
+            info["environment"] = self._add_hud(environment_rgb)
+            info["vision"], info["vision_depth"] = self.mux_render(camera_name="pov")
+        return observation, reward, self.terminated, False, info
+
+    @property
+    def terminated(self):
+        return bool(self._homeostatic_death or not self.object)
