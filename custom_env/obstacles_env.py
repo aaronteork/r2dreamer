@@ -48,11 +48,28 @@ class ObstaclesEnv(HomeostaticAntEnv):
         self._obstacle_mocap_ids = [int(self.model.body_mocapid[
             mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, f"obstacle_{i}")
         ]) for i in range(cfg.pillar_count + cfg.wall_count)]
+        self._obstacle_geom_ids = {
+            int(mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, f"obstacle_geom_{i}"))
+            for i in range(cfg.pillar_count + cfg.wall_count)
+        }
         self.layout = None
         self.total_distance = 0.
+        self.wall_contact_steps = 0
+        self.stall_steps = 0
+        self.occluded_steps = 0
+        self.ever_flipped = False
         self._layout_seed = cfg.seed
         # Group 2 is visible in the standard renderer; rays exclude ant/floor.
         self._obstacle_ray_groups = np.array([0, 0, 1, 0, 0, 0], dtype=np.uint8)
+
+    def _wall_contacting(self) -> bool:
+        if not self._obstacle_geom_ids:
+            return False
+        for index in range(self.data.ncon):
+            contact = self.data.contact[index]
+            if contact.geom1 in self._obstacle_geom_ids or contact.geom2 in self._obstacle_geom_ids:
+                return True
+        return False
 
     def reset(self, *, seed=None, options=None):
         if options:
@@ -78,6 +95,10 @@ class ObstaclesEnv(HomeostaticAntEnv):
         self.current_step = self.food_consumed = self.water_consumed = 0
         self.resources_consumed = []
         self.heat_exposed_time = self.total_distance = 0.
+        self.wall_contact_steps = 0
+        self.stall_steps = 0
+        self.occluded_steps = 0
+        self.ever_flipped = False
         self._homeostatic_death = False
         self.posture = self._get_posture()
         self.prev_drive = self._calculate_drive()
@@ -106,7 +127,12 @@ class ObstaclesEnv(HomeostaticAntEnv):
         position, rotation = self._get_torso_pose()
         self._ego_motion = compute_ego_motion(previous_position, previous_rotation, position, rotation)
         self._previous_torso_position, self._previous_torso_rotation = position, rotation
-        self.total_distance += float(np.linalg.norm(position[:2] - previous_position[:2]))
+        displacement = float(np.linalg.norm(position[:2] - previous_position[:2]))
+        self.total_distance += displacement
+        if displacement < 0.01:
+            self.stall_steps += 1
+        if self._wall_contacting():
+            self.wall_contact_steps += 1
         self.current_step += 1
         self.posture = self._get_posture()
         for resource in list(self.object):
@@ -120,8 +146,19 @@ class ObstaclesEnv(HomeostaticAntEnv):
                     self.water_consumed += 1
                 self.resources_consumed.append(resource[0])
                 self.object.remove(resource)
+        if self.object and not any(self._resource_visible(resource) for resource in self.object):
+            self.occluded_steps += 1
         self._homeostatic_death = bool(abs(self.hunger) > .99999 or abs(self.thirst) > .99999)
         success = not self.object and not self._homeostatic_death
+        is_flipped = bool(self.data.xmat[self.ant_body_id][8] < 0)
+        self.ever_flipped = self.ever_flipped or is_flipped
+        geo_dist = float(self.layout.get("geodesic_shortest_distance", 0.0))
+        euc_dist = float(self.layout.get("euclidean_shortest_distance", 0.0))
+        detour_ratio = float(self.layout.get("detour_ratio", 1.0))
+        if success:
+            geodesic_eff = min(1.0, geo_dist / self.total_distance) if self.total_distance > 0 else 1.0
+        else:
+            geodesic_eff = 0.0
         current_drive = self._calculate_drive()
         self.hunger, self.thirst = np.clip([self.hunger, self.thirst], -1., 1.)
         action_magnitude = float(np.linalg.norm(action[:8]))
@@ -139,10 +176,20 @@ class ObstaclesEnv(HomeostaticAntEnv):
             collection_success=int(success), total_distance=self.total_distance,
             completion_steps=self.current_step if success else float("nan"),
             completion_distance=self.total_distance if success else float("nan"),
+            geodesic_shortest_distance=geo_dist,
+            euclidean_shortest_distance=euc_dist,
+            detour_ratio=detour_ratio,
+            geodesic_path_efficiency=float(geodesic_eff),
+            wall_contact_steps=float(self.wall_contact_steps),
+            stall_steps=float(self.stall_steps),
+            occluded_steps=float(self.occluded_steps),
+            occluded_step_fraction=float(self.occluded_steps / max(1, self.current_step)),
             homeostatic_death=int(self._homeostatic_death),
             termination_reason=1 if self._homeostatic_death else 4 if success else 0,
             posture=self.posture, z_pos=float(position[2]),
-            is_flipped=bool(self.data.xmat[self.ant_body_id][8] < 0),
+            is_flipped=is_flipped,
+            flipped_at_end=int(is_flipped),
+            ever_flipped=int(self.ever_flipped),
             action_magnitude=action_magnitude, reward_homeostatic=homeo_reward,
             reward_movement_penalty=movement_penalty, reward_posture_penalty=posture_penalty,
             ego_motion=self._ego_motion.copy(),

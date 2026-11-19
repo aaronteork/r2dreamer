@@ -84,6 +84,18 @@ OBSTACLES_METRICS = (
     "total_distance", "completion_steps", "completion_distance", "homeostatic_death",
 )
 
+OBSTACLES_NAV_METRICS = (
+    "geodesic_shortest_distance",
+    "euclidean_shortest_distance",
+    "detour_ratio",
+    "geodesic_path_efficiency",
+    "stall_steps",
+    "occluded_steps",
+    "occluded_step_fraction",
+    "flipped_at_end",
+    "ever_flipped",
+)
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Evaluate an R2Dreamer agent.")
@@ -548,6 +560,9 @@ def episode_summary(
     if "collection_success" in info:
         for key in OBSTACLES_METRICS:
             row[key] = scalar(info, key)
+        for key in OBSTACLES_NAV_METRICS:
+            if key in info:
+                row[key] = scalar(info, key)
     return row
 
 
@@ -567,16 +582,54 @@ def evaluation_summary(
     """Create a compact task-level summary alongside per-episode results."""
     if task == "obstacles":
         result = dict(task=task, episodes=len(rows), max_steps=max_steps)
-        for key in ("food_consumed", "water_consumed", "resources_collected", "steps",
-                    "total_distance", "completion_steps", "completion_distance"):
+        summary_keys = [
+            "food_consumed", "water_consumed", "resources_collected", "steps",
+            "total_distance", "completion_steps", "completion_distance",
+        ]
+        present_nav_keys = [
+            key for key in (*OBSTACLES_NAV_METRICS, "wall_contact_steps")
+            if any(key in row for row in rows)
+        ]
+        for key in (*summary_keys, *present_nav_keys):
             values = np.asarray([row.get(key, float("nan")) for row in rows], dtype=float)
             values = values[np.isfinite(values)]
             result[f"mean_{key}"] = float(np.mean(values)) if values.size else float("nan")
             result[f"std_{key}"] = float(np.std(values)) if values.size else float("nan")
             result[f"count_{key}"] = int(values.size)
         result["collection_success_rate"] = float(np.mean([row["collection_success"] for row in rows]))
+        if any("geodesic_path_efficiency" in row for row in rows):
+            succ_eff = [
+                row["geodesic_path_efficiency"] for row in rows
+                if row.get("collection_success", 0) and np.isfinite(row.get("geodesic_path_efficiency", float("nan")))
+            ]
+            result["mean_geodesic_path_efficiency_successful"] = (
+                float(np.mean(succ_eff)) if succ_eff else float("nan")
+            )
         for outcome in ("resources_collected", "homeostatic_termination", "evaluation_cutoff"):
             result[f"{outcome}_episodes"] = sum(row["outcome"] == outcome for row in rows)
+        if any("flipped_at_end" in row for row in rows):
+            timeouts = [row for row in rows if row["outcome"] == "homeostatic_termination"]
+            result["flipped_termination_episodes"] = sum(
+                bool(row.get("flipped_at_end", 0)) for row in timeouts
+            )
+            result["upright_timeout_episodes"] = sum(
+                not bool(row.get("flipped_at_end", 0)) for row in timeouts
+            )
+        if any("detour_ratio" in row for row in rows):
+            for label, pred in (
+                ("direct", lambda r: r < 1.15),
+                ("moderate_detour", lambda r: 1.15 <= r < 1.35),
+                ("hard_detour", lambda r: r >= 1.35),
+            ):
+                bucket = [
+                    row for row in rows
+                    if np.isfinite(row.get("detour_ratio", float("nan"))) and pred(row["detour_ratio"])
+                ]
+                result[f"{label}_episodes"] = len(bucket)
+                result[f"{label}_success_rate"] = (
+                    float(np.mean([row["collection_success"] for row in bucket]))
+                    if bucket else float("nan")
+                )
         return result
     result = {
         "task": task,
@@ -1128,6 +1181,9 @@ def evaluate(
             if task == "obstacles":
                 for key in OBSTACLES_METRICS:
                     step_row[key] = scalar(info, key)
+                for key in OBSTACLES_NAV_METRICS:
+                    if key in info:
+                        step_row[key] = scalar(info, key)
             step_rows.append(step_row)
 
             if task == "obstacles":

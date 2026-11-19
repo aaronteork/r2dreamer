@@ -11,29 +11,30 @@ class ObstaclesConfig(EnvConfig):
     env_name: str = "ObstaclesEnv"
     is_training: bool = False
     max_steps: float = float("inf")
-    num_food: int = 5
-    num_water: int = 5
+    num_food: int = 1
+    num_water: int = 1
     num_heat: int = 0
-    initial_hunger: float = -0.5
-    initial_thirst: float = -0.5
+    initial_hunger: float = -0.30
+    initial_thirst: float = -0.30
     pillar_count: int = 2
-    pillar_diameter: float = 1.5
-    wall_count: int = 2
-    wall_length: float = 3.2
-    wall_thickness: float = 0.6
+    pillar_diameter: float = 1.4
+    wall_count: int = 3
+    wall_length: float = 3.0
+    wall_thickness: float = 0.5
     obstacle_height: float = 2.0
     spawn_x: float = 0.0
     spawn_y: float = 0.0
     spawn_yaw: float = 0.0  # Radians: zero faces world +X.
     # Sampling/reachability margins only; no collision shells or padding.
     path_clearance: float = 0.8
-    obstacle_spacing: float = 1.65
-    boundary_obstacle_gap: float = 1.65
+    obstacle_spacing: float = 1.4
+    boundary_obstacle_gap: float = 1.1
     spawn_obstacle_gap: float = 1.1
-    resource_obstacle_gap: float = 1.15
+    resource_obstacle_gap: float = 1.0
     resource_boundary_gap: float = 1.1
     spawn_resource_gap: float = 1.8
     connectivity_grid_step: float = 0.15
+    min_detour_ratio: float = 1.15
     layout_attempts: int = 1000
     placement_attempts: int = 200
     resource_placement_attempts: int = 10000
@@ -59,6 +60,8 @@ class ObstaclesConfig(EnvConfig):
             value = getattr(self, name)
             if not math.isfinite(value) or value <= 0:
                 raise ValueError(f"{name} must be finite and positive.")
+        if not math.isfinite(self.min_detour_ratio) or self.min_detour_ratio < 1.0:
+            raise ValueError("min_detour_ratio must be finite and at least 1.0.")
         for name in ("layout_attempts", "placement_attempts", "resource_placement_attempts"):
             if not isinstance(getattr(self, name), int) or getattr(self, name) < 1:
                 raise ValueError(f"{name} must be a positive integer.")
