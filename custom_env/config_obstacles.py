@@ -35,20 +35,32 @@ class ObstaclesConfig(EnvConfig):
     spawn_resource_gap: float = 1.8
     connectivity_grid_step: float = 0.15
     min_detour_ratio: float = 1.15
+    layout_mode: str = "random"
+    chicane_primary_need: float = -0.30
+    chicane_secondary_need: float = -0.15
+    chicane_doorway_min: float = 3.0
+    chicane_doorway_max: float = 3.8
+    chicane_baffle_jitter_y: float = 0.4
     layout_attempts: int = 1000
     placement_attempts: int = 200
     resource_placement_attempts: int = 10000
 
     def __post_init__(self):
+        if self.layout_mode not in {"random", "chicane"}:
+            raise ValueError("layout_mode must be 'random' or 'chicane'.")
         for name in ("num_food", "num_water", "pillar_count", "wall_count"):
             value = getattr(self, name)
             if not isinstance(value, int) or isinstance(value, bool) or value < 0:
                 raise ValueError(f"{name} must be a nonnegative integer.")
         if self.num_food + self.num_water == 0:
             raise ValueError("At least one resource is required.")
-        for name in ("initial_hunger", "initial_thirst"):
+        for name in ("initial_hunger", "initial_thirst", "chicane_primary_need", "chicane_secondary_need"):
             if not -0.99999 < getattr(self, name) < 0.99999:
                 raise ValueError(f"{name} must be strictly within the death boundaries.")
+        if not (0.0 < self.chicane_doorway_min <= self.chicane_doorway_max < 2.0 * self.arena_size):
+            raise ValueError("chicane doorway bounds must satisfy 0 < min <= max < arena width.")
+        if not math.isfinite(self.chicane_baffle_jitter_y) or self.chicane_baffle_jitter_y < 0.0:
+            raise ValueError("chicane_baffle_jitter_y must be finite and nonnegative.")
         for name in (
             "arena_size", "pillar_diameter", "wall_length", "wall_thickness",
             "obstacle_height", "path_clearance", "connectivity_grid_step",
@@ -81,3 +93,21 @@ class ObstaclesConfig(EnvConfig):
             (1 + self.initial_hunger + self.num_food * self.replenish_rate) / self.hunger_decay,
             (1 + self.initial_thirst + self.num_water * self.replenish_rate) / self.thirst_decay,
         )) + 1
+
+    @classmethod
+    def chicane(cls, **overrides) -> "ObstaclesConfig":
+        """Build a 1-resource target-primed parameterized Staggered Chicane config."""
+        defaults = dict(
+            layout_mode="chicane",
+            num_food=1,
+            num_water=0,
+            initial_hunger=-0.30,
+            initial_thirst=-0.15,
+            pillar_count=0,
+            wall_count=4,
+            wall_length=4.5,
+            wall_thickness=0.5,
+            min_detour_ratio=1.5,
+        )
+        defaults.update(overrides)
+        return cls(**defaults)

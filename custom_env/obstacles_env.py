@@ -72,24 +72,26 @@ class ObstaclesEnv(HomeostaticAntEnv):
         return False
 
     def reset(self, *, seed=None, options=None):
-        if options:
+        if options and self.cfg.layout_mode != "chicane":
             raise ValueError("Obstacles does not use partition resource-order conditions.")
         if seed is not None:
             self._layout_seed = int(seed)
-        return super().reset(seed=seed)
+        return super().reset(seed=seed, options=options)
 
     def reset_model(self):
-        self.layout = generate_layout(self.cfg, self._layout_seed)
+        self.layout = generate_layout(self.cfg, self._layout_seed, options=self._reset_options)
         for mocap_id, o in zip(self._obstacle_mocap_ids, self.layout["obstacles"]):
             self.data.mocap_pos[mocap_id] = [o["x"], o["y"], self.cfg.obstacle_height/2]
             self.data.mocap_quat[mocap_id] = [math.cos(o["angle"]/2), 0, 0, math.sin(o["angle"]/2)]
+        spawn_x, spawn_y, spawn_yaw = self.layout["spawn"]
         qpos, qvel = self.init_qpos.copy(), self.init_qvel.copy()
-        qpos[:2] = [self.cfg.spawn_x, self.cfg.spawn_y]
-        qpos[3:7] = [math.cos(self.cfg.spawn_yaw/2), 0, 0, math.sin(self.cfg.spawn_yaw/2)]
+        qpos[:2] = [spawn_x, spawn_y]
+        qpos[3:7] = [math.cos(spawn_yaw / 2), 0, 0, math.sin(spawn_yaw / 2)]
         self.set_state(qpos, qvel)
         self._reset_ego_motion_tracking()
         self.object = [tuple(r) for r in self.layout["resources"]]
-        self.hunger, self.thirst = self.cfg.initial_hunger, self.cfg.initial_thirst
+        self.hunger = float(self.layout.get("initial_hunger", self.cfg.initial_hunger))
+        self.thirst = float(self.layout.get("initial_thirst", self.cfg.initial_thirst))
         self._initial_hunger, self._initial_thirst = self.hunger, self.thirst
         self.temperature = 0.
         self.current_step = self.food_consumed = self.water_consumed = 0
@@ -172,7 +174,8 @@ class ObstaclesEnv(HomeostaticAntEnv):
             initial_hunger=self._initial_hunger, initial_thirst=self._initial_thirst,
             food_consumed=self.food_consumed, water_consumed=self.water_consumed,
             resources_collected=self.food_consumed + self.water_consumed,
-            num_food=self.cfg.num_food, num_water=self.cfg.num_water,
+            num_food=int(self.layout.get("num_food", self.cfg.num_food)),
+            num_water=int(self.layout.get("num_water", self.cfg.num_water)),
             collection_success=int(success), total_distance=self.total_distance,
             completion_steps=self.current_step if success else float("nan"),
             completion_distance=self.total_distance if success else float("nan"),

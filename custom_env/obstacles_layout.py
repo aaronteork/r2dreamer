@@ -49,7 +49,7 @@ def obstacle_gap(a, b):
                [obstacle_distance(p, a) for p in pb])
 
 
-def reachable_grid(cfg, obstacles):
+def reachable_grid(cfg, obstacles, spawn=None):
     """Conservative four-neighbour grid; also clear each cell's half diagonal."""
     limit = cfg.arena_size - 0.1 - cfg.path_clearance
     count = math.ceil(2 * limit / cfg.connectivity_grid_step) + 1
@@ -67,7 +67,8 @@ def reachable_grid(cfg, obstacles):
             dist = np.hypot(np.maximum(abs(c*x+s*y)-o["width"]/2, 0),
                             np.maximum(abs(-s*x+c*y)-o["depth"]/2, 0))
         free &= dist > cfg.path_clearance + safety
-    start = (int(np.argmin(abs(axis-cfg.spawn_x))), int(np.argmin(abs(axis-cfg.spawn_y))))
+    sx, sy = (cfg.spawn_x, cfg.spawn_y) if spawn is None else spawn
+    start = (int(np.argmin(abs(axis - sx))), int(np.argmin(abs(axis - sy))))
     reached = set()
     queue = deque([start]) if free[start] else deque()
     while queue:
@@ -159,8 +160,112 @@ def tour_path_metrics(axis, free, spawn, resources):
     return best_geo, best_euc, float(detour_ratio)
 
 
-def generate_layout(cfg, seed):
+def _baffle_segments(edge, width, depth, y, opening_side, gap):
+    """Build two collinear wall segments leaving a doorway on opening_side."""
+    half_w = width / 2.0
+    if opening_side == "west":
+        tip_x = -edge + gap
+        xs = (tip_x + half_w, edge - half_w)
+    elif opening_side == "east":
+        tip_x = edge - gap
+        xs = (tip_x - half_w, -edge + half_w)
+    else:
+        raise ValueError(f"opening_side must be 'west' or 'east', got {opening_side!r}.")
+    return [
+        dict(shape="wall", width=width, depth=depth, x=float(x), y=float(y), angle=0.0)
+        for x in xs
+    ]
+
+
+def generate_chicane_layout(cfg, seed, *, options=None):
+    """Build a parameterized 2-baffle Staggered Chicane layout with 1 primed target."""
+    if cfg.wall_count != 4 or cfg.pillar_count != 0:
+        raise ValueError("Chicane layout requires wall_count=4 and pillar_count=0.")
+    opts = dict(options or {})
+    rng = np.random.default_rng(seed)
+    first_opening = opts.get("first_opening")
+    if first_opening is None:
+        first_opening = "west" if rng.random() < 0.5 else "east"
+    if first_opening not in {"west", "east"}:
+        raise ValueError("chicane first_opening must be 'west' or 'east'.")
+    target_resource = opts.get("target_resource")
+    if target_resource is None:
+        target_resource = "food" if rng.random() < 0.5 else "water"
+    if target_resource not in {"food", "water"}:
+        raise ValueError("chicane target_resource must be 'food' or 'water'.")
+
+    edge = cfg.arena_size - 0.1
+    second_opening = "east" if first_opening == "west" else "west"
+    half_t = cfg.wall_thickness / 2.0
+
+    for _ in range(cfg.layout_attempts):
+        gap1 = float(rng.uniform(cfg.chicane_doorway_min, cfg.chicane_doorway_max))
+        gap2 = float(rng.uniform(cfg.chicane_doorway_min, cfg.chicane_doorway_max))
+        jitter = cfg.chicane_baffle_jitter_y
+        y1 = -2.0 + float(rng.uniform(-jitter, jitter))
+        y2 = 2.0 + float(rng.uniform(-jitter, jitter))
+        obstacles = (
+            _baffle_segments(edge, cfg.wall_length, cfg.wall_thickness, y1, first_opening, gap1)
+            + _baffle_segments(edge, cfg.wall_length, cfg.wall_thickness, y2, second_opening, gap2)
+        )
+        south_mid = 0.5 * (-edge + (y1 - half_t))
+        spawn_y = float(np.clip(
+            south_mid + rng.uniform(-0.2, 0.2),
+            -edge + 1.2,
+            y1 - half_t - 1.2,
+        ))
+        if first_opening == "west":
+            spawn_x = float(rng.uniform(2.6, edge - 1.3))
+            spawn_yaw = math.pi
+            goal_x = float(rng.uniform(-(edge - 1.1), -1.5))
+        else:
+            spawn_x = float(rng.uniform(-(edge - 1.3), -2.6))
+            spawn_yaw = 0.0
+            goal_x = float(rng.uniform(1.5, edge - 1.1))
+        goal_y = float(rng.uniform(y2 + half_t + 1.05, edge - 1.05))
+        spawn = (spawn_x, spawn_y)
+        axis, free, reached = reachable_grid(cfg, obstacles, spawn=spawn)
+        if not reached or len(reached) != int(free.sum()):
+            continue
+        goal_cell = (int(np.argmin(abs(axis - goal_x))), int(np.argmin(abs(axis - goal_y))))
+        if goal_cell not in reached:
+            continue
+        resources = [(target_resource, goal_x, goal_y)]
+        geo_dist, euc_dist, detour_ratio = tour_path_metrics(axis, free, spawn, resources)
+        if not math.isfinite(geo_dist) or detour_ratio < cfg.min_detour_ratio:
+            continue
+        if target_resource == "food":
+            init_h, init_t = cfg.chicane_primary_need, cfg.chicane_secondary_need
+            n_food, n_water = 1, 0
+        else:
+            init_h, init_t = cfg.chicane_secondary_need, cfg.chicane_primary_need
+            n_food, n_water = 0, 1
+        return dict(
+            seed=int(seed),
+            layout_family="chicane",
+            first_opening=first_opening,
+            target_resource=target_resource,
+            doorway_gaps=[gap1, gap2],
+            baffle_ys=[y1, y2],
+            initial_hunger=float(init_h),
+            initial_thirst=float(init_t),
+            num_food=n_food,
+            num_water=n_water,
+            spawn=[spawn_x, spawn_y, spawn_yaw],
+            obstacles=obstacles,
+            resources=resources,
+            reachable_grid_cells=len(reached),
+            geodesic_shortest_distance=geo_dist,
+            euclidean_shortest_distance=euc_dist,
+            detour_ratio=detour_ratio,
+        )
+    raise ValueError("Could not generate a reachable chicane layout within layout_attempts.")
+
+
+def generate_layout(cfg, seed, *, options=None):
     """Use a private RNG so layouts are independent of policy/training RNG state."""
+    if getattr(cfg, "layout_mode", "random") == "chicane":
+        return generate_chicane_layout(cfg, seed, options=options)
     rng = np.random.default_rng(seed)
     shapes = [("cylinder", cfg.pillar_diameter, cfg.pillar_diameter)] * cfg.pillar_count
     shapes += [("wall", cfg.wall_length, cfg.wall_thickness)] * cfg.wall_count
