@@ -72,7 +72,7 @@ class ObstaclesEnv(HomeostaticAntEnv):
         return False
 
     def reset(self, *, seed=None, options=None):
-        if options and self.cfg.layout_mode != "chicane":
+        if options and self.cfg.layout_mode not in {"chicane", "t_divider"}:
             raise ValueError("Obstacles does not use partition resource-order conditions.")
         if seed is not None:
             self._layout_seed = int(seed)

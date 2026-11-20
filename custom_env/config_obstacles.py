@@ -16,9 +16,9 @@ class ObstaclesConfig(EnvConfig):
     num_heat: int = 0
     initial_hunger: float = -0.30
     initial_thirst: float = -0.30
-    pillar_count: int = 2
+    pillar_count: int = 0
     pillar_diameter: float = 1.4
-    wall_count: int = 3
+    wall_count: int = 2
     wall_length: float = 3.0
     wall_thickness: float = 0.5
     obstacle_height: float = 2.0
@@ -46,8 +46,8 @@ class ObstaclesConfig(EnvConfig):
     resource_placement_attempts: int = 10000
 
     def __post_init__(self):
-        if self.layout_mode not in {"random", "chicane"}:
-            raise ValueError("layout_mode must be 'random' or 'chicane'.")
+        if self.layout_mode not in {"random", "chicane", "t_divider"}:
+            raise ValueError("layout_mode must be 'random', 'chicane', or 't_divider'.")
         for name in ("num_food", "num_water", "pillar_count", "wall_count"):
             value = getattr(self, name)
             if not isinstance(value, int) or isinstance(value, bool) or value < 0:
@@ -108,6 +108,24 @@ class ObstaclesConfig(EnvConfig):
             wall_length=4.5,
             wall_thickness=0.5,
             min_detour_ratio=1.5,
+        )
+        defaults.update(overrides)
+        return cls(**defaults)
+
+    @classmethod
+    def t_divider(cls, **overrides) -> "ObstaclesConfig":
+        """Build a 2-resource T-divider layout config with 1.0 m-thick walls."""
+        defaults = dict(
+            layout_mode="t_divider",
+            num_food=1,
+            num_water=1,
+            initial_hunger=-0.30,
+            initial_thirst=-0.30,
+            pillar_count=0,
+            wall_count=3,
+            wall_length=2.8,
+            wall_thickness=1.0,
+            min_detour_ratio=1.15,
         )
         defaults.update(overrides)
         return cls(**defaults)

@@ -262,10 +262,150 @@ def generate_chicane_layout(cfg, seed, *, options=None):
     raise ValueError("Could not generate a reachable chicane layout within layout_attempts.")
 
 
+def _segment_intersects_wall(p0, p1, wall):
+    """Return True if segment p0->p1 intersects an axis-aligned wall box."""
+    x0, y0 = p0
+    x1, y1 = p1
+    ang = wall.get("angle", 0.0)
+    # Transform endpoints into wall local frame (axis-aligned in local space)
+    c, s = math.cos(-ang), math.sin(-ang)
+    def to_local(px, py):
+        dx, dy = px - wall["x"], py - wall["y"]
+        return c * dx - s * dy, s * dx + c * dy
+    ax, ay = to_local(x0, y0)
+    bx, by = to_local(x1, y1)
+    hw, hd = wall["width"] / 2.0, wall["depth"] / 2.0
+    t0, t1 = 0.0, 1.0
+    dx, dy = bx - ax, by - ay
+    for p, q in ((-dx, ax + hw), (dx, hw - ax), (-dy, ay + hd), (dy, hd - ay)):
+        if abs(p) < 1e-12:
+            if q < 0:
+                return False
+        else:
+            r = q / p
+            if p < 0:
+                if r > t1:
+                    return False
+                if r > t0:
+                    t0 = r
+            else:
+                if r < t0:
+                    return False
+                if r < t1:
+                    t1 = r
+    return t0 <= t1
+
+
+def generate_t_divider_layout(cfg, seed, *, options=None):
+    """Build a 2-resource T-divider layout with 1.0 m walls and wide corridors."""
+    if cfg.wall_count != 3 or cfg.pillar_count != 0:
+        raise ValueError("T-divider layout requires wall_count=3 and pillar_count=0.")
+    opts = dict(options or {})
+    rng = np.random.default_rng(seed)
+    food_side = opts.get("food_side")
+    if food_side is None:
+        food_side = "west" if rng.random() < 0.5 else "east"
+    if food_side not in {"west", "east"}:
+        raise ValueError("t_divider food_side must be 'west' or 'east'.")
+
+    edge = cfg.arena_size - 0.1
+    half_t = cfg.wall_thickness / 2.0
+    half_l = cfg.wall_length / 2.0
+    r_obs = max(cfg.resource_obstacle_gap, 1.0)
+    r_bnd = max(cfg.resource_boundary_gap, 1.1)
+
+    for _ in range(cfg.layout_attempts):
+        y_bar = float(rng.uniform(-0.9, -0.5))
+        x_bar = float(rng.uniform(-0.3, 0.3))
+        bar_width = float(rng.uniform(4.6, min(5.4, 2.0 * cfg.wall_length)))
+        seg_offset = max(0.0, bar_width / 2.0 - half_l)
+        x_spur = float(x_bar + rng.uniform(-0.2, 0.2))
+        y_spur = float(y_bar + half_t + half_l - 0.1)
+
+        obstacles = [
+            dict(shape="wall", width=cfg.wall_length, depth=cfg.wall_thickness,
+                 x=float(x_bar - seg_offset), y=y_bar, angle=0.0),
+            dict(shape="wall", width=cfg.wall_length, depth=cfg.wall_thickness,
+                 x=float(x_bar + seg_offset), y=y_bar, angle=0.0),
+            dict(shape="wall", width=cfg.wall_length, depth=cfg.wall_thickness,
+                 x=x_spur, y=y_spur, angle=math.pi / 2.0),
+        ]
+
+        spawn_y_max = y_bar - half_t - max(cfg.spawn_obstacle_gap, 1.6)
+        if spawn_y_max <= -4.35:
+            continue
+        spawn_x = float(rng.uniform(-0.6, 0.6))
+        spawn_y = float(rng.uniform(-4.4, spawn_y_max))
+        spawn_yaw = float(math.pi / 2.0 + rng.uniform(-0.25, 0.25))
+        spawn = (spawn_x, spawn_y)
+
+        wx_lo, wx_hi = -edge + r_bnd, x_spur - half_t - r_obs
+        ex_lo, ex_hi = x_spur + half_t + r_obs, edge - r_bnd
+        ny_lo, ny_hi = y_bar + half_t + r_obs, edge - r_bnd
+        if wx_hi <= wx_lo or ex_hi <= ex_lo or ny_hi <= ny_lo:
+            continue
+
+        axis, free, reached = reachable_grid(cfg, obstacles, spawn=spawn)
+        if not reached or len(reached) != int(free.sum()):
+            continue
+
+        placed = None
+        for _ in range(200):
+            west_pos = (float(rng.uniform(wx_lo, wx_hi)), float(rng.uniform(ny_lo, ny_hi)))
+            east_pos = (float(rng.uniform(ex_lo, ex_hi)), float(rng.uniform(ny_lo, ny_hi)))
+            if any(obstacle_distance(p, o) < cfg.resource_obstacle_gap
+                   for p in (west_pos, east_pos) for o in obstacles):
+                continue
+            if not all(any(_segment_intersects_wall(spawn, p, o) for o in obstacles)
+                       for p in (west_pos, east_pos)):
+                continue
+            if any(tuple(int(np.argmin(abs(axis - v))) for v in p) not in reached
+                   for p in (west_pos, east_pos)):
+                continue
+            placed = (west_pos, east_pos)
+            break
+        if placed is None:
+            continue
+
+        west_pos, east_pos = placed
+        if food_side == "west":
+            resources = [("food", *west_pos), ("water", *east_pos)]
+        else:
+            resources = [("food", *east_pos), ("water", *west_pos)]
+
+        geo_dist, euc_dist, detour_ratio = tour_path_metrics(axis, free, spawn, resources)
+        if not math.isfinite(geo_dist) or detour_ratio < cfg.min_detour_ratio:
+            continue
+
+        return dict(
+            seed=int(seed),
+            layout_family="t_divider",
+            food_side=food_side,
+            crossbar_width=bar_width,
+            crossbar_center=[x_bar, y_bar],
+            spur_center=[x_spur, y_spur],
+            initial_hunger=float(cfg.initial_hunger),
+            initial_thirst=float(cfg.initial_thirst),
+            num_food=1,
+            num_water=1,
+            spawn=[spawn_x, spawn_y, spawn_yaw],
+            obstacles=obstacles,
+            resources=resources,
+            reachable_grid_cells=len(reached),
+            geodesic_shortest_distance=geo_dist,
+            euclidean_shortest_distance=euc_dist,
+            detour_ratio=detour_ratio,
+        )
+    raise ValueError("Could not generate a reachable T-divider layout within layout_attempts.")
+
+
 def generate_layout(cfg, seed, *, options=None):
     """Use a private RNG so layouts are independent of policy/training RNG state."""
-    if getattr(cfg, "layout_mode", "random") == "chicane":
+    mode = getattr(cfg, "layout_mode", "random")
+    if mode == "chicane":
         return generate_chicane_layout(cfg, seed, options=options)
+    if mode == "t_divider":
+        return generate_t_divider_layout(cfg, seed, options=options)
     rng = np.random.default_rng(seed)
     shapes = [("cylinder", cfg.pillar_diameter, cfg.pillar_diameter)] * cfg.pillar_count
     shapes += [("wall", cfg.wall_length, cfg.wall_thickness)] * cfg.wall_count

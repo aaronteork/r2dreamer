@@ -101,7 +101,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Evaluate an R2Dreamer agent.")
     parser.add_argument(
         "--task",
-        choices=("forage", "imagine", "partition", "obstacles", "chicane"),
+        choices=("forage", "imagine", "partition", "obstacles", "chicane", "t_divider"),
         required=True,
         help="Evaluation task.",
     )
@@ -121,7 +121,7 @@ def parse_args() -> argparse.Namespace:
         "--episodes",
         type=int,
         default=None,
-        help="Number of episodes (default: 1 forage, 100 imagine/partition, 50 obstacles, 40 chicane).",
+        help="Number of episodes (default: 1 forage, 100 imagine/partition, 50 obstacles/t_divider, 40 chicane).",
     )
     parser.add_argument(
         "--max-steps",
@@ -176,7 +176,7 @@ def parse_args() -> argparse.Namespace:
         help="Number of future steps in each imagination rollout.",
     )
     args = parser.parse_args()
-    if args.task in {"obstacles", "chicane"}:
+    if args.task in {"obstacles", "chicane", "t_divider"}:
         # Match partition's sampled actor actions and record the effective mode.
         args.stochastic = True
 
@@ -302,8 +302,8 @@ def make_partition_env(
 
 def _build_obstacles_env(config: Any, *, seed: int,
                          render_size: tuple[int, int] | None = None,
-                         chicane: bool = False) -> Any:
-    """Build an isolated obstacle/chicane task without inheriting training resource counts."""
+                         layout_mode: str = "random") -> Any:
+    """Build an isolated obstacle/chicane/t_divider task without inheriting training resource counts."""
     from custom_env.config_obstacles import ObstaclesConfig
     from custom_env.obstacles_env import ObstaclesEnv
 
@@ -315,20 +315,31 @@ def _build_obstacles_env(config: Any, *, seed: int,
     configured.update(seed=seed, device=torch.device(config.model.device),
                       image_size=render_size or policy_size, is_training=False,
                       num_heat=0, obs_space_dim=26, imagine=False, max_steps=float("inf"))
-    obs_cfg = ObstaclesConfig.chicane(**configured) if chicane else ObstaclesConfig(**configured)
+    if layout_mode == "chicane":
+        obs_cfg = ObstaclesConfig.chicane(**configured)
+    elif layout_mode == "t_divider":
+        obs_cfg = ObstaclesConfig.t_divider(**configured)
+    else:
+        obs_cfg = ObstaclesConfig(**configured)
     return R2DreamerEnvAdapter(ObstaclesEnv(obs_cfg), seed=seed, policy_size=policy_size)
 
 
 def make_obstacles_env(config: Any, *, seed: int,
                        render_size: tuple[int, int] | None = None) -> Any:
     """Build the independent clutter task; never inherit training resource counts."""
-    return _build_obstacles_env(config, seed=seed, render_size=render_size, chicane=False)
+    return _build_obstacles_env(config, seed=seed, render_size=render_size, layout_mode="random")
 
 
 def make_chicane_env(config: Any, *, seed: int,
                      render_size: tuple[int, int] | None = None) -> Any:
     """Build the parameterized 1-resource Staggered Chicane detour task."""
-    return _build_obstacles_env(config, seed=seed, render_size=render_size, chicane=True)
+    return _build_obstacles_env(config, seed=seed, render_size=render_size, layout_mode="chicane")
+
+
+def make_t_divider_env(config: Any, *, seed: int,
+                       render_size: tuple[int, int] | None = None) -> Any:
+    """Build the parameterized 2-resource T-divider detour task."""
+    return _build_obstacles_env(config, seed=seed, render_size=render_size, layout_mode="t_divider")
 
 
 class R2DreamerEnvAdapter:
@@ -593,7 +604,7 @@ def evaluation_summary(
     task: str, max_steps: int, rows: list[dict[str, Any]]
 ) -> dict[str, Any]:
     """Create a compact task-level summary alongside per-episode results."""
-    if task in {"obstacles", "chicane"}:
+    if task in {"obstacles", "chicane", "t_divider"}:
         result = dict(task=task, episodes=len(rows), max_steps=max_steps)
         summary_keys = [
             "food_consumed", "water_consumed", "resources_collected", "steps",
@@ -646,6 +657,7 @@ def evaluation_summary(
         for col, values in (
             ("first_opening", ("west", "east")),
             ("target_resource", ("food", "water")),
+            ("food_side", ("west", "east")),
         ):
             if any(col in row for row in rows):
                 for val in values:
@@ -801,6 +813,19 @@ def balanced_chicane_conditions(
         for resource in ("food", "water")
     ]
     return _balanced_2x2_schedule(combinations, episodes, seed)
+
+
+def balanced_t_divider_conditions(
+    episodes: int, seed: int
+) -> list[dict[str, str]]:
+    """Balance food bay placement (west vs east) across episodes."""
+    sides = ("west", "east")
+    conditions = [{"food_side": side} for side in sides for _ in range(episodes // 2)]
+    rng = np.random.default_rng(seed)
+    if episodes % 2 == 1:
+        conditions.append({"food_side": sides[int(rng.integers(2))]})
+    rng.shuffle(conditions)
+    return conditions
 
 
 def set_torch_seed(seed: int) -> None:
@@ -1159,6 +1184,8 @@ def evaluate(
         conditions = balanced_resource_conditions(episodes, first_seed)
     elif task == "chicane":
         conditions = balanced_chicane_conditions(episodes, first_seed)
+    elif task == "t_divider":
+        conditions = balanced_t_divider_conditions(episodes, first_seed)
     else:
         conditions = [None] * episodes
 
@@ -1166,7 +1193,7 @@ def evaluate(
         seed = first_seed + episode
         latent_seed = first_seed + 1_000_000_000 + episode
         observation = env.reset(seed=seed, options=condition)
-        if task in {"obstacles", "chicane"} and layouts is not None:
+        if task in {"obstacles", "chicane", "t_divider"} and layouts is not None:
             layouts.append({"episode": episode, **env._env.layout})
         set_torch_seed(latent_seed)
         state = agent.get_initial_state(1)
@@ -1224,7 +1251,7 @@ def evaluate(
             if task == "partition":
                 for key in PARTITION_PATH_METRICS:
                     step_row[key] = scalar(info, key)
-            if task in {"obstacles", "chicane"}:
+            if task in {"obstacles", "chicane", "t_divider"}:
                 for key in OBSTACLES_METRICS:
                     step_row[key] = scalar(info, key)
                 for key in OBSTACLES_NAV_METRICS:
@@ -1232,7 +1259,7 @@ def evaluate(
                         step_row[key] = scalar(info, key)
             step_rows.append(step_row)
 
-            if task in {"obstacles", "chicane"}:
+            if task in {"obstacles", "chicane", "t_divider"}:
                 if scalar(info, "homeostatic_death"):
                     outcome = "homeostatic_termination"
                     break
@@ -1310,6 +1337,9 @@ def make_task_env(
     if args.task == "chicane":
         env = make_chicane_env(config, seed=args.seed, render_size=render_size)
         return env, env._env.cfg.natural_step_bound
+    if args.task == "t_divider":
+        env = make_t_divider_env(config, seed=args.seed, render_size=render_size)
+        return env, env._env.cfg.natural_step_bound
     if args.task == "partition":
         env = make_partition_env(config, seed=args.seed, render_size=render_size)
         return env, int(env._env.cfg.max_steps)
@@ -1343,7 +1373,7 @@ def main() -> None:
         )
 
     default_episodes = {
-        "forage": 1, "imagine": 100, "partition": 100, "obstacles": 50, "chicane": 40
+        "forage": 1, "imagine": 100, "partition": 100, "obstacles": 50, "chicane": 40, "t_divider": 50
     }
     episodes = args.episodes or default_episodes[args.task]
     render_size = None if args.no_video else (args.video_size, args.video_size)
@@ -1360,7 +1390,7 @@ def main() -> None:
     recorder = None
     prediction_rows: list[dict[str, Any]] = []
     layouts: list[dict[str, Any]] = []
-    obstacles_config = asdict(env._env.cfg) if args.task in {"obstacles", "chicane"} else None
+    obstacles_config = asdict(env._env.cfg) if args.task in {"obstacles", "chicane", "t_divider"} else None
     try:
         print(f"Evaluating checkpoint: {model_path.name}", flush=True)
         agent = load_agent(model_path, config, env, device)
@@ -1437,6 +1467,8 @@ def main() -> None:
         "condition_schedule": (
             "seeded_balanced_2x2"
             if args.task in {"imagine", "partition", "chicane"}
+            else "seeded_balanced_food_side"
+            if args.task == "t_divider"
             else None
         ),
         "stochastic_policy": args.stochastic,
@@ -1454,7 +1486,7 @@ def main() -> None:
         ),
         "policy_resolution": list(map(int, config.env.size)),
     }
-    if args.task in {"obstacles", "chicane"}:
+    if args.task in {"obstacles", "chicane", "t_divider"}:
         layouts_path = output_dir / f"{stem}_layouts.json"
         with layouts_path.open("w", encoding="utf-8") as file:
             json.dump(layouts, file, indent=2)
